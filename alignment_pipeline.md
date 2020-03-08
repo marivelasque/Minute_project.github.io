@@ -34,9 +34,10 @@ The fastqc report shows a low amount of contaminants, adaptors, quality score, N
 
 ## Download Drosophila genome
 
-	  wget ftp://ftp.ensembl.org/pub/release-94/fasta/drosophila_melanogaster/dna/Drosophila_melanogaster.BDGP6.dna.toplevel.fa.gz
 
-    wget ftp://ftp.ensembl.org/pub/release-89/gtf/drosophila_melanogaster/Drosophila_melanogaster.BDGP6.89.gtf.gz
+	wget ftp://ftp.ensembl.org/pub/release-94/fasta/drosophila_melanogaster/dna/Drosophila_melanogaster.BDGP6.dna.toplevel.fa.gz
+
+    	wget ftp://ftp.ensembl.org/pub/release-89/gtf/drosophila_melanogaster/Drosophila_melanogaster.BDGP6.89.gtf.gz
 
 ## Alignment with RSEM
 

@@ -3,7 +3,7 @@
 
 Aligment was perfomed using RSEM running with Bowtie2. RSEM is a software tool for quantifying transcript abundances from RNA-Seq data. RSEM mapped with Bowtie2 was used as it outperforms other aligment methods (Teng et al., 2016). 
 
-    module load rsem bowtie2 java-jdk/1.8.0_20
+    	module load rsem bowtie2 java-jdk/1.8.0_20
 
 
 ## Test quality control

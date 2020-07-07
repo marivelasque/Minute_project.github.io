@@ -1,0 +1,2219 @@
+---
+title: "Minute data analysis"
+author: "Mari"
+date: "May 29, 2019"
+output:
+  html_document: 
+    fig_height: 15
+    fig_width: 15
+    theme: cosmo
+    toc: yes
+editor_options: 
+  chunk_output_type: console
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=TRUE,
+                      cache.path ='Minute_cache/', 
+                      keep.source=TRUE,
+                      fig.width =10,
+                      fig.height=8,
+                      fig.align = 'center',
+                      fig.path='Minute_cache/figures/') 
+```
+
+
+#Minute data analysis
+
+Using the output of the estimation of gene and isoform expression levels using RSEM implemented using bowtie2 (see *S1* for RSEM pipeline), it is possible to obtain the gene counts necessary to perform the network analysis on the minute data to identify how ribosomal groups alters the expression profile in flies. In co-expression networks, the nodes (i.e. gene networks) and its relationships are determined by pairwise correlation between different expression profiles, usually present in two treatment groups. Therefore, we build an independent co-expression network for each RNAi line that will be paired with the control "control". Followed the network construction, we will identify the module containing the gene knocked down (*gene knocked down module*) and its associated network. We are particularly interested in identifying whether the expression profile of each group is similar overall. This can be done in two ways:
+* Identifying whether genes of interest (i.e. genes used in the RNAi lines) are present at the gene knocked down module
+* Determining if the properties of the gene knocked down module changed across the different RNAi lines used in this study. Using *preservation statistics*, we can evaluate if the module preservation across multiple studies.
+
+In summary, the workflow is the following:
+
+  1.  Data input and cleaning
+  2.  Network construction
+  3.  Relating modules and module eigengenes to the treatment group (i.e. pairwise comparison)
+  4.  Identification of genes of interest
+  5.  Module preservation (pairwise comparison between two RNAi lines)
+  6.  Visualisation of the preserved gene network between treatments
+  7.  GO term enrichment
+
+Packages used in this study:
+```{r libraries, message = FALSE, warning=FALSE}
+library(tidyverse)
+library(knitr)
+library(WGCNA)
+library(flashClust)
+library(WGCNA)
+library(GSEABase)
+library(tximport)
+library(ggplot2)
+library(png)
+library(tximport)
+library(kableExtra)
+library(biomaRt)
+library(devtools)
+library(ggraph)
+library(igraph)
+library(tidyverse)
+library(clusterProfiler)
+library(ComplexHeatmap)
+library(viridis)
+library(patchwork)
+library(circlize)
+library(chorddiag)
+library("org.Dm.eg.db")
+allowWGCNAThreads()
+options(stringsAsFactors = FALSE)# Important for WGCNA!
+cor <- WGCNA::cor
+```
+
+```{r, include=FALSE}
+load("~/Dropbox/Pesquisa/Post-doc/Minute_project/WGCNA/RDS/Minute_analysis.RData")
+
+```
+##  1- Data input and cleaning {.tabset .tabset-fade}
+Load metadata information
+```{r}
+Fly_treatments <- read_csv("Fly/METADATA/detailed_samples.csv", col_types = cols()) %>% replace(.=="a_w", "wild_type") %>% replace(.=="w_", "control")
+
+#Set working directories for the reads
+Files <- file.path("Fly", "RSEM", paste0(Fly_treatments$sample, ".genes.results"))
+
+#Rename reads (matching information on the metadata)
+names(Files) <- c(Fly_treatments$sample)
+Gene_counts <- tximport(Files,type = "rsem", txIn = FALSE, txOut = FALSE)
+
+#Isolate RSEM counts
+
+Gene_count <- as.data.frame(Gene_counts$counts)
+
+```
+
+Filter all genes that were differentially expressed between wild type and control 
+```{r}
+dge_list <-read_csv("Wild_sig.csv") %>% 
+  rename("target_id" = "gene_id") %>%
+  filter(padj < 0.05) #making sure all p-adjusted value are smaller than 0.05
+
+'%ni%' <- Negate('%in%') ##function for excluding wildtype results
+
+Gene_count <- Gene_count %>% 
+  filter(rownames(Gene_count) %ni% dge_list$gene_id)
+
+#Save counts
+write.csv(Gene_count, "Fly/Gene_count.csv")
+```
+
+##  2- Network construction {.tabset .tabset-fade}
+
+### RpL3 group
+Parcel metadata file to use only data from RpL3
+```{r}
+RPL3_treatments <-Fly_treatments %>% filter(condition %in% c("RPL3", "control"))
+Gene_count <- read.csv("Fly/Gene_count.csv")
+rownames(Gene_count)<- Gene_count$X
+Gene_count$X=NULL
+Gene_expDat <- as.data.frame(t(Gene_count))
+RPL3_expDat <- Gene_expDat %>% filter(rownames(Gene_expDat) %in% RPL3_treatments$sample)
+dim(RPL3_expDat)
+#head(RPL3_expDat)#check if it looks ok
+```
+
+Removing gene outliers
+
+```{r, results="hide", results="hide"}
+gsg = goodSamplesGenes(RPL3_expDat, verbose = 3)
+gsg$allOK
+if (!gsg$allOK)
+{
+  if (sum(!gsg$goodGenes)>0)
+    printFlush(paste("Removing genes:",
+                     paste(names(RPL3_expDat)[!gsg$goodGenes], collapse = ", ")))
+  if (sum(!gsg$goodSamples)>0)
+    printFlush(paste("Removing samples:",
+                     paste(rownames(RPL3_expDat)[!gsg$goodSamples], collapse = ",
+")))
+  RPL3_expDat = RPL3_expDat[gsg$goodSamples, gsg$goodGenes]
+}
+```
+Check data clustering
+
+```{r, warning=FALSE}
+sampleTree = hclust(dist(RPL3_expDat), method = "average")
+sizeGrWindow(12,9)
+par(cex = 0.8)
+par(mar = c(0,4,2,0))
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="", cex.lab = 1.5, cex.axis = 1.5, cex.main = 2)
+```
+
+Call the WGCNA funtion that will estimate the soft threshold and the gene co-expression network between humans and treatment groups withing the minute data
+```{r}
+source("Function_WGCNA_gene_coexpresison_network.R")
+```
+
+Build a gene coexpresison network using WGCNA package and the function build on: "Function_WGCNA_gene_coexpresison_network.R". 
+This function will take a while it also runs in silence, to adjust change this alters "verbose = 0" to verbose = 1 or 2
+
+```{r}
+RPL3_net<-gene_network(RPL3_expDat)
+saveRDS(RPL3_net, "RDS/RPL3_net.rds")
+```
+
+### RpL14 group
+Parcel metadata file to use only data from RpL14
+```{r}
+RPL14_treatments <-Fly_treatments %>% filter(condition %in% c("RPL14", "control"))
+Gene_count <- read.csv("Fly/Gene_count.csv")
+rownames(Gene_count)<- Gene_count$X
+Gene_count$X=NULL
+Gene_expDat <- as.data.frame(t(Gene_count))
+
+RPL14_expDat <- Gene_expDat %>% filter(rownames(Gene_expDat) %in% RPL14_treatments$sample)
+dim(RPL14_expDat)
+#head(RPL14_expDat)#check if it looks ok
+```
+Removing gene outliers
+
+```{r, results="hide"}
+gsg = goodSamplesGenes(RPL14_expDat, verbose = 3)
+gsg$allOK
+if (!gsg$allOK)
+{
+  if (sum(!gsg$goodGenes)>0)
+    printFlush(paste("Removing genes:",
+                     paste(names(RPL14_expDat)[!gsg$goodGenes], collapse = ", ")))
+  if (sum(!gsg$goodSamples)>0)
+    printFlush(paste("Removing samples:",
+                     paste(rownames(RPL14_expDat)[!gsg$goodSamples], collapse = ",
+")))
+  RPL14_expDat = RPL14_expDat[gsg$goodSamples, gsg$goodGenes]
+}
+```
+Check data clustering
+
+```{r, warning=FALSE}
+sampleTree = hclust(dist(RPL14_expDat), method = "average")
+sizeGrWindow(12,9)
+par(cex = 0.8)
+par(mar = c(0,4,2,0))
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="", cex.lab = 1.5, cex.axis = 1.5,
+     cex.main = 2)
+```
+Call the WGCNA funtion that will estimate the soft threshold and the gene co-expression network between humans and treatment groups withing the minute data
+```{r}
+source("Function_WGCNA_gene_coexpresison_network.R")
+```
+
+Build a gene coexpresison network using WGCNA package and the function build on: "Function_WGCNA_gene_coexpresison_network.R". 
+This function will take a while it also runs in silence, to adjust change this alters "verbose = 0" to verbose = 1 or 2
+
+```{r}
+RPL14_net<-gene_network(RPL14_expDat)
+saveRDS(RPL14_net, "RDS/RPL14_net.rds")
+```
+### RpS13 group
+Parcel metadata file to use only data from RpS13
+```{r}
+RPS13_treatments <-Fly_treatments %>% filter(condition %in% c("RPS13", "control"))
+Gene_count <- read.csv("Fly/Gene_count.csv")
+rownames(Gene_count)<- Gene_count$X
+Gene_count$X=NULL
+Gene_expDat <- as.data.frame(t(Gene_count))
+
+RPS13_expDat <- Gene_expDat %>% filter(rownames(Gene_expDat) %in% RPS13_treatments$sample)
+dim(RPS13_expDat)
+#head(RPS13_expDat)#check if it looks ok
+```
+Removing gene outliers
+
+```{r, results="hide"}
+gsg = goodSamplesGenes(RPS13_expDat, verbose = 3)
+gsg$allOK
+if (!gsg$allOK)
+{
+  if (sum(!gsg$goodGenes)>0)
+    printFlush(paste("Removing genes:",
+                     paste(names(RPS13_expDat)[!gsg$goodGenes], collapse = ", ")))
+  if (sum(!gsg$goodSamples)>0)
+    printFlush(paste("Removing samples:",
+                     paste(rownames(RPS13_expDat)[!gsg$goodSamples], collapse = ",
+")))
+  RPS13_expDat = RPS13_expDat[gsg$goodSamples, gsg$goodGenes]
+}
+```
+Check data clustering
+
+```{r, warning=FALSE}
+sampleTree = hclust(dist(RPS13_expDat), method = "average")
+sizeGrWindow(12,9)
+par(cex = 0.8)
+par(mar = c(0,4,2,0))
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="", cex.lab = 1.5, cex.axis = 1.5,
+     cex.main = 2)
+```
+Call the WGCNA funtion that will estimate the soft threshold and the gene co-expression network between humans and treatment groups withing the minute data
+```{r}
+source("Function_WGCNA_gene_coexpresison_network.R")
+```
+
+Build a gene coexpresison network using WGCNA package and the function build on: "Function_WGCNA_gene_coexpresison_network.R". 
+This function will take a while it also runs in silence, to adjust change this alters "verbose = 0" to verbose = 1 or 2
+
+```{r}
+RPS13_net<-gene_network(RPS13_expDat)
+saveRDS(RPS13_net, "RDS/RPS13_net.rds")
+```
+### RpS19b group
+Parcel metadata file to use only data from RpS19b
+```{r}
+RPS19b_treatments <-Fly_treatments %>% filter(condition %in% c("RPS19b", "control"))
+Gene_count <- read.csv("Fly/Gene_count.csv")
+rownames(Gene_count)<- Gene_count$X
+Gene_count$X=NULL
+Gene_expDat <- as.data.frame(t(Gene_count))
+
+RPS19b_expDat <- Gene_expDat %>% filter(rownames(Gene_expDat) %in% RPS19b_treatments$sample)
+dim(RPS19b_expDat)
+#head(RPS19b_expDat)#check if it looks ok
+```
+
+Removing gene outliers
+
+```{r, results="hide"}
+gsg = goodSamplesGenes(RPS19b_expDat, verbose = 3)
+gsg$allOK
+if (!gsg$allOK)
+{
+  if (sum(!gsg$goodGenes)>0)
+    printFlush(paste("Removing genes:",
+                     paste(names(RPS19b_expDat)[!gsg$goodGenes], collapse = ", ")))
+  if (sum(!gsg$goodSamples)>0)
+    printFlush(paste("Removing samples:",
+                     paste(rownames(RPS19b_expDat)[!gsg$goodSamples], collapse = ",
+")))
+  RPS19b_expDat = RPS19b_expDat[gsg$goodSamples, gsg$goodGenes]
+}
+```
+Check data clustering
+
+```{r, warning=FALSE}
+sampleTree = hclust(dist(RPS19b_expDat), method = "average")
+sizeGrWindow(12,9)
+par(cex = 0.8)
+par(mar = c(0,4,2,0))
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="", cex.lab = 1.5, cex.axis = 1.5,
+     cex.main = 2)
+```
+Call the WGCNA funtion that will estimate the soft threshold and the gene co-expression network between humans and treatment groups withing the minute data
+```{r}
+source("Function_WGCNA_gene_coexpresison_network.R")
+```
+
+Build a gene coexpresison network using WGCNA package and the function build on: "Function_WGCNA_gene_coexpresison_network.R". 
+This function will take a while it also runs in silence, to adjust change this alters "verbose = 0" to verbose = 1 or 2
+
+```{r}
+RPS19b_net<-gene_network(RPS19b_expDat)
+saveRDS(RPS19b_net, "RDS/RPS19b_net.rds")
+```
+
+### RpL19 group
+Parcel metadata file to use only data from RpL19
+```{r}
+RPL19_treatments <-Fly_treatments %>% filter(condition %in% c("RPL19", "control"))
+Gene_count <- read.csv("Fly/Gene_count.csv")
+rownames(Gene_count)<- Gene_count$X
+Gene_count$X=NULL
+Gene_expDat <- as.data.frame(t(Gene_count))
+
+RPL19_expDat <- Gene_expDat %>% filter(rownames(Gene_expDat) %in% RPL19_treatments$sample)
+dim(RPL19_expDat)
+#head(RPL19_expDat)#check if it looks ok
+```
+Removing gene outliers
+
+```{r, results="hide"}
+gsg = goodSamplesGenes(RPL19_expDat, verbose = 3)
+gsg$allOK
+if (!gsg$allOK)
+{
+  if (sum(!gsg$goodGenes)>0)
+    printFlush(paste("Removing genes:",
+                     paste(names(RPL19_expDat)[!gsg$goodGenes], collapse = ", ")))
+  if (sum(!gsg$goodSamples)>0)
+    printFlush(paste("Removing samples:",
+                     paste(rownames(RPL19_expDat)[!gsg$goodSamples], collapse = ",
+")))
+  RPL19_expDat = RPL19_expDat[gsg$goodSamples, gsg$goodGenes]
+}
+```
+Check data clustering
+
+```{r, warning=FALSE}
+sampleTree = hclust(dist(RPL19_expDat), method = "average")
+sizeGrWindow(12,9)
+par(cex = 0.8)
+par(mar = c(0,4,2,0))
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="", cex.lab = 1.5, cex.axis = 1.5,
+     cex.main = 2)
+```
+Call the WGCNA funtion that will estimate the soft threshold and the gene co-expression network between humans and treatment groups withing the minute data
+```{r}
+source("Function_WGCNA_gene_coexpresison_network.R")
+```
+
+Build a gene coexpresison network using WGCNA package and the function build on: "Function_WGCNA_gene_coexpresison_network.R". 
+This function will take a while it also runs in silence, to adjust change this alters "verbose = 0" to verbose = 1 or 2
+
+```{r}
+RPL19_net<-gene_network(RPL19_expDat)
+saveRDS(RPL19_net, "RDS/RPL19_net.rds")
+```
+### RpL24-like group
+
+Parcel metadata file to use only data from RpL24-like
+```{r}
+RPL24_like_treatments <-Fly_treatments %>% filter(condition %in% c("RPL24_like", "control"))
+Gene_count <- read.csv("Fly/Gene_count.csv")
+rownames(Gene_count)<- Gene_count$X
+Gene_count$X=NULL
+Gene_expDat <- as.data.frame(t(Gene_count))
+
+RPL24_like_expDat <- Gene_expDat %>% filter(rownames(Gene_expDat) %in% RPL24_like_treatments$sample)
+dim(RPL24_like_expDat)
+#head(RPL24_like_expDat)#check if it looks ok
+```
+
+Removing gene outliers
+
+```{r, results="hide"}
+gsg = goodSamplesGenes(RPL24_like_expDat, verbose = 3)
+gsg$allOK
+if (!gsg$allOK)
+{
+  if (sum(!gsg$goodGenes)>0)
+    printFlush(paste("Removing genes:",
+                     paste(names(RPL24_like_expDat)[!gsg$goodGenes], collapse = ", ")))
+  if (sum(!gsg$goodSamples)>0)
+    printFlush(paste("Removing samples:",
+                     paste(rownames(RPL24_like_expDat)[!gsg$goodSamples], collapse = ",
+")))
+  RPL24_like_expDat = RPL24_like_expDat[gsg$goodSamples, gsg$goodGenes]
+}
+```
+Check data clustering
+```{r, warning=FALSE}
+sampleTree = hclust(dist(RPL24_like_expDat), method = "average")
+sizeGrWindow(12,9)
+par(cex = 0.8)
+par(mar = c(0,4,2,0))
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="", cex.lab = 1.5, cex.axis = 1.5,
+     cex.main = 2)
+```
+Call the WGCNA funtion that will estimate the soft threshold and the gene co-expression network between humans and treatment groups withing the minute data
+```{r}
+source("Function_WGCNA_gene_coexpresison_network.R")
+```
+
+Build a gene coexpresison network using WGCNA package and the function build on: "Function_WGCNA_gene_coexpresison_network.R". 
+This function will take a while it also runs in silence, to adjust change this alters "verbose = 0" to verbose = 1 or 2
+```{r, warning=FALSE}
+RPL24_like_net<-gene_network(RPL24_like_expDat)
+saveRDS(RPL24_like_net, "RDS/RPL24_like_net.rds")
+```
+### RpL30 group
+Parcel metadata file to use only data from RpL30
+```{r}
+RPL30_treatments <-Fly_treatments %>% filter(condition %in% c("RPL30", "control"))
+Gene_count <- read.csv("Fly/Gene_count.csv")
+rownames(Gene_count)<- Gene_count$X
+Gene_count$X=NULL
+Gene_expDat <- as.data.frame(t(Gene_count))
+
+RPL30_expDat <- Gene_expDat %>% filter(rownames(Gene_expDat) %in% RPL30_treatments$sample)
+dim(RPL30_expDat)
+#head(RPL30_expDat)#check if it looks ok
+```
+
+Removing gene outliers
+
+```{r, results="hide"}
+gsg = goodSamplesGenes(RPL30_expDat, verbose = 3)
+gsg$allOK
+if (!gsg$allOK)
+{
+  if (sum(!gsg$goodGenes)>0)
+    printFlush(paste("Removing genes:",
+                     paste(names(RPL30_expDat)[!gsg$goodGenes], collapse = ", ")))
+  if (sum(!gsg$goodSamples)>0)
+    printFlush(paste("Removing samples:",
+                     paste(rownames(RPL30_expDat)[!gsg$goodSamples], collapse = ",
+")))
+  RPL30_expDat = RPL30_expDat[gsg$goodSamples, gsg$goodGenes]
+}
+```
+Check data clustering
+
+```{r, warning=FALSE}
+sampleTree = hclust(dist(RPL30_expDat), method = "average")
+sizeGrWindow(12,9)
+par(cex = 0.8)
+par(mar = c(0,4,2,0))
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="", cex.lab = 1.5, cex.axis = 1.5,
+     cex.main = 2)
+```
+Call the WGCNA funtion that will estimate the soft threshold and the gene co-expression network between humans and treatment groups withing the minute data
+```{r}
+source("Function_WGCNA_gene_coexpresison_network.R")
+```
+
+Build a gene coexpresison network using WGCNA package and the function build on: "Function_WGCNA_gene_coexpresison_network.R". 
+This function will take a while it also runs in silence, to adjust change this alters "verbose = 0" to verbose = 1 or 2
+```{r, warning=FALSE}
+RPL30_net<-gene_network(RPL30_expDat)
+saveRDS(RPL30_net, "RDS/RPL30_net.rds")
+```
+## 3- Relating modules and module eigengenes to the treatment group (i.e. pairwise comparison) {.tabset .tabset-fade}
+
+Loading the gene names and gene descriptions.
+
+```{r}
+mart <- useMart(biomart = "ENSEMBL_MART_ENSEMBL", dataset = "dmelanogaster_gene_ensembl", host = 'may2017.archive.ensembl.org')
+Fly_go <- getBM(attributes = c("ensembl_gene_id", "external_gene_name", "goslim_goa_description"), mart = mart)
+Fly_go <- dplyr::rename(Fly_go, gene_id = ensembl_gene_id, gene_name = external_gene_name, Term = goslim_goa_description)
+```
+Loading list of genes of interest
+```{r}
+rnai<- c("RpL3","RpL14","RpS13","RpL24","RpL24-like","RpL30","RpS19b","RpL19","Xrp1", "mRpL3","mRpL14","mRpS13","mRpL24","mRpL24-like","mRPL30","mRpS19b","mRpL19")
+hsf_inter <- read_csv("hsf_inter.csv", col_types = cols())
+heatshock<-hsf_inter$Gene
+```
+
+### RpL3 group
+Load the previously saved data and the annotation for the go analysis and subsequent steps
+
+```{r, warning=FALSE}
+RPL3_net <- readRDS("RDS/RPL3_net.rds")
+```
+
+Estimate the gene expression profiles (i.e. module eigengene)
+```{r}
+RPL3_MEs0 <- moduleEigengenes(RPL3_expDat, RPL3_net$colors)$eigengenes
+RPL3_MEs <- orderMEs(RPL3_MEs0)
+```
+Creating a treatment lable (correlation between control and the group)
+
+```{r}
+RPL3_group <- as.data.frame(as.numeric(gsub("control",0,gsub("RPL3",1,RPL3_treatments$condition))))
+names(RPL3_group) = "RPL3_group"
+```
+Match genes_id in the data set to those of the annotation file (Fly_go)
+```{r}
+genes_id = names(RPL3_expDat)
+genes_id2annot = match(genes_id, Fly_go$gene_id)
+```
+Relating modules to the  RpL3 group. As the module eigengene is good summary of the gene expression profile of a module, we will correlate eigengenes with these traits and to look for the most significant associations.
+
+```{r}
+#Pearson Correlation Coefficient for the  RpL3 group. The higher the "absolute value of RPL3_moduleTraitCor", more significant is the gene related with the  RpL3 group.
+RPL3_moduleTraitCor = cor(RPL3_expDat, RPL3_group, use = "p")
+##Get the significancy per module (pvalue)
+RPL3_moduleTraitPvalue = corPvalueStudent(RPL3_moduleTraitCor, 8)
+
+RPL3_moduleTraitCor.df <- as.data.frame(RPL3_moduleTraitCor)
+RPL3_moduleTraitPvalue.df <- as.data.frame(RPL3_moduleTraitPvalue)
+
+names(RPL3_moduleTraitCor.df) = paste("cor", names(RPL3_moduleTraitCor.df), sep = ".")
+```
+Output file for gene ontology analysis
+```{r}
+RPL3_Dif_exp_network = data.frame(ProbeID = names(RPL3_expDat), Fly_go[genes_id2annot,], labels2colors(RPL3_net$colors), RPL3_moduleTraitCor.df,RPL3_moduleTraitPvalue.df ) #merge gene significance
+
+RPL3_Dif_exp_network  <- dplyr::select(RPL3_Dif_exp_network, gene_id = ProbeID, gene_name, RPL3_DGE= cor.RPL3_group ,GS = RPL3_group ,Term) %>% drop_na(gene_name) %>% drop_na(Term) %>% drop_na(RPL3_DGE)
+RPL3_Dif_exp_network  <- RPL3_Dif_exp_network %>% arrange(desc(RPL3_DGE)) #arrage by the significance of the differential expression
+```
+Select genes used in this study (all RNAi lines)
+
+```{r}
+RPL3_genes <- which(RPL3_Dif_exp_network$gene_name %in% rnai)
+RPL3_heatshock <- which(RPL3_Dif_exp_network$gene_name %in% heatshock)
+```
+
+Table of differentially expressed genes in the RpL3 group, highlighting the genes used in this study
+```{r RpL3 TableConnectivity, echo=F}
+RPL3_Dif_exp_network %>% kable(format = "html", caption = "RpL3 preserved gene network.") %>% row_spec(RPL3_genes, bold = T, color = "white", background = "#1d2ad7") %>% row_spec(RPL3_heatshock, bold = T, color = "white", background = "#D7261E") %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(height = "400px")  
+```
+
+### RpL14 group
+Load the previously saved data and the annotation for the go analysis and subsequent steps
+
+```{r, warning=FALSE}
+RPL14_net <- readRDS("RDS/RPL14_net.rds")
+```
+Estimate the gene expression profiles (i.e. module eigengene)
+
+```{r}
+RPL14_MEs0 <- moduleEigengenes(RPL14_expDat, RPL14_net$colors)$eigengenes
+RPL14_MEs <- orderMEs(RPL14_MEs0)
+```
+Creating a treatment lable (correlation between control and the group)
+
+```{r}
+RPL14_group <- as.data.frame(as.numeric(gsub("control",0,gsub("RPL14",1,RPL14_treatments$condition))))
+names(RPL14_group) = "RPL14_group"
+```
+Match genes_id in the data set to those of the annotation file (Fly_go)
+```{r}
+genes_id = names(RPL14_expDat)
+genes_id2annot = match(genes_id, Fly_go$gene_id)
+```
+Relating modules to the  RpL14 group. As the module eigengene is good summary of the gene expression profile of a module, we will correlate eigengenes with these traits and to look for the most significant associations.
+
+```{r}
+#Pearson Correlation Coefficient for the  RpL14 group. The higher the "absolute value of RPL14_moduleTraitCor", more significant is the gene related with the  RpL14 group.
+RPL14_moduleTraitCor = cor(RPL14_expDat, RPL14_group, use = "p")
+##Get the significancy per module (pvalue)
+RPL14_moduleTraitPvalue = corPvalueStudent(RPL14_moduleTraitCor, 8)
+
+RPL14_moduleTraitCor.df <- as.data.frame(RPL14_moduleTraitCor)
+RPL14_moduleTraitPvalue.df <- as.data.frame(RPL14_moduleTraitPvalue)
+
+names(RPL14_moduleTraitCor.df) = paste("cor", names(RPL14_moduleTraitCor.df), sep = ".")
+```
+Output file for gene ontology analysis
+```{r}
+RPL14_Dif_exp_network = data.frame(ProbeID = names(RPL14_expDat), Fly_go[genes_id2annot,], labels2colors(RPL14_net$colors), RPL14_moduleTraitCor.df,RPL14_moduleTraitPvalue.df ) #merge gene significance
+
+RPL14_Dif_exp_network  <- dplyr::select(RPL14_Dif_exp_network, gene_id = ProbeID, gene_name, RPL14_DGE= cor.RPL14_group ,GS = RPL14_group ,Term) %>% drop_na(gene_name) %>% drop_na(Term)  %>% drop_na(RPL14_DGE)
+RPL14_Dif_exp_network  <- RPL14_Dif_exp_network %>% arrange(desc(RPL14_DGE)) #arrage by the significance of the differential expression
+```
+Select genes used in this study (all RNAi lines)
+
+```{r}
+RPL14_genes <- which(RPL14_Dif_exp_network$gene_name %in% rnai)
+RPL14_heatshock <- which(RPL14_Dif_exp_network$gene_name %in% heatshock)
+```
+
+Table of differentially expressed genes in the RpL14 group, highlighting the genes used in this study
+```{r RpL14 TableConnectivity, echo=F}
+RPL14_Dif_exp_network %>% kable(format = "html", caption = "RpL14 preserved gene network.") %>% row_spec(RPL14_genes, bold = T, color = "white", background = "#1d2ad7") %>% row_spec(RPL14_heatshock, bold = T, color = "white", background = "#D7261E")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(height = "400px")  
+```
+
+### RpS13 group
+Load the previously saved data and the annotation for the go analysis and subsequent steps
+
+```{r, warning=FALSE}
+RPS13_net <- readRDS("RDS/RPS13_net.rds")
+```
+Estimate the gene expression profiles (i.e. module eigengene)
+
+```{r}
+RPS13_MEs0 <- moduleEigengenes(RPS13_expDat, RPS13_net$colors)$eigengenes
+RPS13_MEs <- orderMEs(RPS13_MEs0)
+```
+Creating a treatment lable (correlation between control and the group)
+
+```{r}
+RPS13_group <- as.data.frame(as.numeric(gsub("control",0,gsub("RPS13",1,RPS13_treatments$condition))))
+names(RPS13_group) = "RPS13_group"
+```
+Match genes_id in the data set to those of the annotation file (Fly_go)
+```{r}
+genes_id = names(RPS13_expDat)
+genes_id2annot = match(genes_id, Fly_go$gene_id)
+```
+Relating modules to the  RpS13 group. As the module eigengene is good summary of the gene expression profile of a module, we will correlate eigengenes with these traits and to look for the most significant associations.
+
+```{r}
+#Pearson Correlation Coefficient for the  RpS13 group. The higher the "absolute value of RPS13_moduleTraitCor", more significant is the gene related with the  RpS13 group.
+RPS13_moduleTraitCor = cor(RPS13_expDat, RPS13_group, use = "p")
+##Get the significancy per module (pvalue)
+RPS13_moduleTraitPvalue = corPvalueStudent(RPS13_moduleTraitCor, 8)
+
+RPS13_moduleTraitCor.df <- as.data.frame(RPS13_moduleTraitCor)
+RPS13_moduleTraitPvalue.df <- as.data.frame(RPS13_moduleTraitPvalue)
+
+names(RPS13_moduleTraitCor.df) = paste("cor", names(RPS13_moduleTraitCor.df), sep = ".")
+
+```
+Output file for gene ontology analysis
+```{r}
+RPS13_Dif_exp_network = data.frame(ProbeID = names(RPS13_expDat), Fly_go[genes_id2annot,], labels2colors(RPS13_net$colors), RPS13_moduleTraitCor.df,RPS13_moduleTraitPvalue.df ) #merge gene significance
+
+RPS13_Dif_exp_network  <- dplyr::select(RPS13_Dif_exp_network, gene_id = ProbeID, gene_name, RPS13_DGE= cor.RPS13_group ,GS = RPS13_group ,Term) %>% drop_na(gene_name) %>% drop_na(Term)  %>% drop_na(RPS13_DGE)
+RPS13_Dif_exp_network  <- RPS13_Dif_exp_network %>% arrange(desc(RPS13_DGE)) #arrage by the significance of the differential expression
+```
+Select genes used in this study (all RNAi lines)
+
+```{r}
+RPS13_genes <- which(RPS13_Dif_exp_network$gene_name %in% rnai)
+RPS13_heatshock <- which(RPS13_Dif_exp_network$gene_name %in% heatshock)
+```
+
+Table of differentially expressed genes in the RpS13 group, highlighting the genes used in this study
+```{r RpS13 TableConnectivity, echo=F}
+RPS13_Dif_exp_network %>% kable(format = "html", caption = "RpS13 preserved gene network.") %>% row_spec(RPS13_genes, bold = T, color = "white", background = "#1d2ad7") %>% row_spec(RPS13_heatshock, bold = T, color = "white", background = "#D7261E")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(height = "400px")  
+```
+### RpS19b group
+Load the previously saved data and the annotation for the go analysis and subsequent steps
+
+```{r, warning=FALSE}
+RPS19b_net <- readRDS("RDS/RPS19b_net.rds")
+```
+Estimate the gene expression profiles (i.e. module eigengene)
+
+```{r}
+RPS19b_MEs0 <- moduleEigengenes(RPS19b_expDat, RPS19b_net$colors)$eigengenes
+RPS19b_MEs <- orderMEs(RPS19b_MEs0)
+```
+Creating a treatment lable (correlation between control and the group)
+
+```{r}
+RPS19b_group <- as.data.frame(as.numeric(gsub("control",0,gsub("RPS19b",1,RPS19b_treatments$condition))))
+names(RPS19b_group) = "RPS19b_group"
+```
+Match genes_id in the data set to those of the annotation file (Fly_go)
+```{r}
+genes_id = names(RPS19b_expDat)
+genes_id2annot = match(genes_id, Fly_go$gene_id)
+```
+Relating modules to the  RpS19b group. As the module eigengene is good summary of the gene expression profile of a module, we will correlate eigengenes with these traits and to look for the most significant associations.
+
+```{r}
+#Pearson Correlation Coefficient for the  RpS19b group. The higher the "absolute value of RPS19b_moduleTraitCor", more significant is the gene related with the  RpS19b group.
+RPS19b_moduleTraitCor = cor(RPS19b_expDat, RPS19b_group, use = "p")
+##Get the significancy per module (pvalue)
+RPS19b_moduleTraitPvalue = corPvalueStudent(RPS19b_moduleTraitCor, 8)
+
+RPS19b_moduleTraitCor.df <- as.data.frame(RPS19b_moduleTraitCor)
+RPS19b_moduleTraitPvalue.df <- as.data.frame(RPS19b_moduleTraitPvalue)
+
+names(RPS19b_moduleTraitCor.df) = paste("cor", names(RPS19b_moduleTraitCor.df), sep = ".")
+```
+Output file for gene ontology analysis
+```{r}
+RPS19b_Dif_exp_network = data.frame(ProbeID = names(RPS19b_expDat), Fly_go[genes_id2annot,], labels2colors(RPS19b_net$colors), RPS19b_moduleTraitCor.df,RPS19b_moduleTraitPvalue.df ) #merge gene significance
+
+RPS19b_Dif_exp_network  <- dplyr::select(RPS19b_Dif_exp_network, gene_id = ProbeID, gene_name, RPS19b_DGE= cor.RPS19b_group ,GS = RPS19b_group ,Term) %>% drop_na(gene_name) %>% drop_na(Term)  %>% drop_na(RPS19b_DGE)
+RPS19b_Dif_exp_network  <- RPS19b_Dif_exp_network %>% arrange(desc(RPS19b_DGE)) #arrage by the significance of the differential expression
+```
+Select genes used in this study (all RNAi lines)
+
+```{r}
+RPS19b_genes <- which(RPS19b_Dif_exp_network$gene_name %in% rnai)
+RPS19b_heatshock <- which(RPS19b_Dif_exp_network$gene_name %in% heatshock)
+```
+
+Table of differentially expressed genes in the RpS19b group, highlighting the genes used in this study
+```{r RpS19b TableConnectivity, echo=F}
+RPS19b_Dif_exp_network %>% kable(format = "html", caption = "RpS19b preserved gene network.") %>% row_spec(RPS19b_genes, bold = T, color = "white", background = "#1d2ad7") %>% row_spec(RPS19b_heatshock, bold = T, color = "white", background = "#D7261E")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(height = "400px")  
+```
+
+### RpL19 group
+Load the previously saved data and the annotation for the go analysis and subsequent steps
+
+```{r, warning=FALSE}
+RPL19_net <- readRDS("RDS/RPL19_net.rds")
+```
+Estimate the gene expression profiles (i.e. module eigengene)
+
+```{r}
+RPL19_MEs0 <- moduleEigengenes(RPL19_expDat, RPL19_net$colors)$eigengenes
+RPL19_MEs <- orderMEs(RPL19_MEs0)
+```
+Creating a treatment lable (correlation between control and the group)
+
+```{r}
+RPL19_group <- as.data.frame(as.numeric(gsub("control",0,gsub("RPL19",1,RPL19_treatments$condition))))
+names(RPL19_group) = "RPL19_group"
+```
+Match genes_id in the data set to those of the annotation file (Fly_go)
+```{r}
+genes_id = names(RPL19_expDat)
+genes_id2annot = match(genes_id, Fly_go$gene_id)
+```
+Relating modules to the  RpL19 group. As the module eigengene is good summary of the gene expression profile of a module, we will correlate eigengenes with these traits and to look for the most significant associations.
+
+```{r}
+#Pearson Correlation Coefficient for the  RpL19 group. The higher the "absolute value of RPL19_moduleTraitCor", more significant is the gene related with the  RpL19 group.
+RPL19_moduleTraitCor = cor(RPL19_expDat, RPL19_group, use = "p")
+##Get the significancy per module (pvalue)
+RPL19_moduleTraitPvalue = corPvalueStudent(RPL19_moduleTraitCor, 8)
+
+RPL19_moduleTraitCor.df <- as.data.frame(RPL19_moduleTraitCor)
+RPL19_moduleTraitPvalue.df <- as.data.frame(RPL19_moduleTraitPvalue)
+
+names(RPL19_moduleTraitCor.df) = paste("cor", names(RPL19_moduleTraitCor.df), sep = ".")
+```
+Output file for gene ontology analysis
+```{r}
+RPL19_Dif_exp_network = data.frame(ProbeID = names(RPL19_expDat), Fly_go[genes_id2annot,], labels2colors(RPL19_net$colors), RPL19_moduleTraitCor.df,RPL19_moduleTraitPvalue.df ) #merge gene significance
+
+RPL19_Dif_exp_network  <- dplyr::select(RPL19_Dif_exp_network, gene_id = ProbeID, gene_name, RPL19_DGE= cor.RPL19_group ,GS = RPL19_group ,Term) %>% drop_na(gene_name) %>% drop_na(Term)  %>% drop_na(RPL19_DGE)
+RPL19_Dif_exp_network  <- RPL19_Dif_exp_network %>% arrange(desc(RPL19_DGE)) #arrage by the significance of the differential expression
+```
+Select genes used in this study (all RNAi lines)
+
+```{r}
+RPL19_genes <- which(RPL19_Dif_exp_network$gene_name %in% rnai)
+RPL19_heatshock <- which(RPL19_Dif_exp_network$gene_name %in% heatshock)
+```
+
+Table of differentially expressed genes in the RpL19 group, highlighting the genes used in this study
+```{r RpL19 TableConnectivity, echo=F}
+RPL19_Dif_exp_network %>% kable(format = "html", caption = "RpL19 preserved gene network.") %>% row_spec(RPL19_genes, bold = T, color = "white", background = "#1d2ad7") %>% row_spec(RPL19_heatshock, bold = T, color = "white", background = "#D7261E")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(height = "400px")  
+```
+
+### RpL24-like group
+Load the previously saved data and the annotation for the go analysis and subsequent steps
+
+```{r, warning=FALSE}
+RPL24_like_net <- readRDS("RDS/RPL24_like_net.rds")
+```
+Estimate the gene expression profiles (i.e. module eigengene)
+
+```{r}
+RPL24_like_MEs0 <- moduleEigengenes(RPL24_like_expDat, RPL24_like_net$colors)$eigengenes
+RPL24_like_MEs <- orderMEs(RPL24_like_MEs0)
+```
+Creating a treatment lable (correlation between control and the group)
+
+```{r}
+RPL24_like_group <- as.data.frame(as.numeric(gsub("control",0,gsub("RPL24_like",1,RPL24_like_treatments$condition))))
+names(RPL24_like_group) = "RPL24_like_group"
+```
+Match genes_id in the data set to those of the annotation file (Fly_go)
+```{r}
+genes_id = names(RPL24_like_expDat)
+genes_id2annot = match(genes_id, Fly_go$gene_id)
+```
+Relating modules to the  RpL24-like group. As the module eigengene is good summary of the gene expression profile of a module, we will correlate eigengenes with these traits and to look for the most significant associations.
+
+```{r}
+#Pearson Correlation Coefficient for the  RpL24-like group. The higher the "absolute value of RPL24_like_moduleTraitCor", more significant is the gene related with the  RpL24-like group.
+RPL24_like_moduleTraitCor = cor(RPL24_like_expDat, RPL24_like_group, use = "p")
+##Get the significancy per module (pvalue)
+RPL24_like_moduleTraitPvalue = corPvalueStudent(RPL24_like_moduleTraitCor, 8)
+
+RPL24_like_moduleTraitCor.df <- as.data.frame(RPL24_like_moduleTraitCor)
+RPL24_like_moduleTraitPvalue.df <- as.data.frame(RPL24_like_moduleTraitPvalue)
+
+names(RPL24_like_moduleTraitCor.df) = paste("cor", names(RPL24_like_moduleTraitCor.df), sep = ".")
+```
+Output file for gene ontology analysis
+```{r}
+RPL24_like_Dif_exp_network = data.frame(ProbeID = names(RPL24_like_expDat), Fly_go[genes_id2annot,], labels2colors(RPL24_like_net$colors), RPL24_like_moduleTraitCor.df,RPL24_like_moduleTraitPvalue.df ) #merge gene significance
+
+RPL24_like_Dif_exp_network  <- dplyr::select(RPL24_like_Dif_exp_network, gene_id = ProbeID, gene_name, RPL24_like_DGE= cor.RPL24_like_group ,GS = RPL24_like_group ,Term) %>% drop_na(gene_name) %>% drop_na(Term)  %>% drop_na(RPL24_like_DGE)
+RPL24_like_Dif_exp_network  <- RPL24_like_Dif_exp_network %>% arrange(desc(RPL24_like_DGE)) #arrage by the significance of the differential expression
+```
+Select genes used in this study (all RNAi lines)
+
+```{r}
+RPL24_like_genes <- which(RPL24_like_Dif_exp_network$gene_name %in% rnai)
+RPL24_like_heatshock <- which(RPL24_like_Dif_exp_network$gene_name %in% heatshock)
+```
+
+Table of differentially expressed genes in the RpL24-like group, highlighting the genes used in this study
+```{r RpL24-like TableConnectivity, echo=F}
+RPL24_like_Dif_exp_network %>% kable(format = "html", caption = "RpL24-like preserved gene network.") %>% row_spec(RPL24_like_genes, bold = T, color = "white", background = "#1d2ad7") %>% row_spec(RPL24_like_heatshock, bold = T, color = "white", background = "#D7261E")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(height = "400px")  
+```
+
+### RPL30 group
+Load the previously saved data and the annotation for the go analysis and subsequent steps
+
+```{r, warning=FALSE}
+RPL30_net <- readRDS("RDS/RPL30_net.rds")
+```
+Estimate the gene expression profiles (i.e. module eigengene)
+
+```{r}
+RPL30_MEs0 <- moduleEigengenes(RPL30_expDat, RPL30_net$colors)$eigengenes
+RPL30_MEs <- orderMEs(RPL30_MEs0)
+```
+Creating a treatment lable (correlation between control and the group)
+
+```{r}
+RPL30_group <- as.data.frame(as.numeric(gsub("control",0,gsub("RPL30",1,RPL30_treatments$condition))))
+names(RPL30_group) = "RPL30_group"
+```
+Match genes_id in the data set to those of the annotation file (Fly_go)
+```{r}
+genes_id = names(RPL30_expDat)
+genes_id2annot = match(genes_id, Fly_go$gene_id)
+```
+Relating modules to the  RPL30 group. As the module eigengene is good summary of the gene expression profile of a module, we will correlate eigengenes with these traits and to look for the most significant associations.
+
+```{r}
+#Pearson Correlation Coefficient for the  RPL30 group. The higher the "absolute value of RPL30_moduleTraitCor", more significant is the gene related with the  RPL30 group.
+RPL30_moduleTraitCor = cor(RPL30_expDat, RPL30_group, use = "p")
+##Get the significancy per module (pvalue)
+RPL30_moduleTraitPvalue = corPvalueStudent(RPL30_moduleTraitCor, 8)
+
+RPL30_moduleTraitCor.df <- as.data.frame(RPL30_moduleTraitCor)
+RPL30_moduleTraitPvalue.df <- as.data.frame(RPL30_moduleTraitPvalue)
+
+names(RPL30_moduleTraitCor.df) = paste("cor", names(RPL30_moduleTraitCor.df), sep = ".")
+```
+Output file for gene ontology analysis
+```{r}
+RPL30_Dif_exp_network = data.frame(ProbeID = names(RPL30_expDat), Fly_go[genes_id2annot,], labels2colors(RPL30_net$colors), RPL30_moduleTraitCor.df,RPL30_moduleTraitPvalue.df ) #merge gene significance
+
+RPL30_Dif_exp_network  <- dplyr::select(RPL30_Dif_exp_network, gene_id = ProbeID, gene_name, RPL30_DGE= cor.RPL30_group ,GS = RPL30_group ,Term) %>% drop_na(gene_name) %>% drop_na(Term)  %>% drop_na(RPL30_DGE)
+RPL30_Dif_exp_network  <- RPL30_Dif_exp_network %>% arrange(desc(RPL30_DGE)) #arrage by the significance of the differential expression
+```
+Select genes used in this study (all RNAi lines)
+
+```{r}
+RPL30_genes <- which(RPL30_Dif_exp_network$gene_name %in% rnai)
+RPL30_heatshock <- which(RPL30_Dif_exp_network$gene_name %in% heatshock)
+```
+
+Table of differentially expressed genes in the RPL30 group, highlighting the genes used in this study
+```{r RPL30 TableConnectivity, echo=F}
+RPL30_Dif_exp_network %>% kable(format = "html", caption = "RPL30 preserved gene network.") %>% row_spec(RPL30_genes, bold = T, color = "white", background = "#1d2ad7") %>% row_spec(RPL30_heatshock, bold = T, color = "white", background = "#D7261E")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(height = "400px")  
+```
+
+##  4- Identification of genes of interest {.tabset .tabset-fade}
+
+### The _RpL3_-sensitive module
+
+```{r warning = FALSE}
+RPL3_softpower<- softP(RPL3_expDat)
+RPL3_Alldegrees <- intramodularConnectivity.fromExpr(RPL3_expDat,RPL3_net$colors, power = RPL3_softpower)
+rownames(RPL3_Alldegrees) <- colnames(RPL3_expDat)
+RPL3_geneModuleMembership <- as.data.frame(cor(RPL3_expDat, RPL3_MEs, use = "p"));
+
+#Isolate RpL3 gene module
+(RPL3_Module <- RPL3_net$colors[which(colnames(RPL3_expDat) == "FBgn0020910")])
+
+RPL3_ModuleGenes <- colnames(RPL3_expDat)[RPL3_net$colors == RPL3_Module]
+connectivity_RPL3_Module <- data.frame(kWithin = RPL3_Alldegrees[RPL3_ModuleGenes,"kWithin"], gene_id = rownames(RPL3_Alldegrees[RPL3_ModuleGenes,]), moduleMembership = RPL3_geneModuleMembership[RPL3_ModuleGenes, paste0("ME",RPL3_Module)]) %>% left_join(Fly_go, by = "gene_id")
+```
+
+### The _RpL14_-sensitive module
+
+```{r}
+RPL14_softpower<- softP( RPL14_expDat)
+RPL14_Alldegrees <- intramodularConnectivity.fromExpr(RPL14_expDat,RPL14_net$colors, power = RPL14_softpower)
+rownames(RPL14_Alldegrees) <- colnames(RPL14_expDat)
+RPL14_geneModuleMembership <- as.data.frame(cor(RPL14_expDat, RPL14_MEs, use = "p"));
+
+#Isolate RpL14 gene module
+(RPL14_Module <- RPL14_net$colors[which(colnames(RPL14_expDat) == "FBgn0017579")])
+
+RPL14_ModuleGenes <- colnames(RPL14_expDat)[RPL14_net$colors == RPL14_Module]
+connectivity_RPL14_Module <- data.frame(kWithin = RPL14_Alldegrees[RPL14_ModuleGenes,"kWithin"], gene_id = rownames(RPL14_Alldegrees[RPL14_ModuleGenes,]), moduleMembership = RPL14_geneModuleMembership[RPL14_ModuleGenes, paste0("ME",RPL14_Module)]) %>% left_join(Fly_go, by = "gene_id")
+```
+
+### The _RpS13_-sensitive module
+
+```{r}
+RPS13_softpower<- softP(RPS13_expDat)
+RPS13_Alldegrees <- intramodularConnectivity.fromExpr(RPS13_expDat,RPS13_net$colors, power = RPS13_softpower)
+rownames(RPS13_Alldegrees) <- colnames(RPS13_expDat)
+RPS13_geneModuleMembership <- as.data.frame(cor(RPS13_expDat, RPS13_MEs, use = "p"));
+
+#Isolate RpS13 gene module
+(RPS13_Module <- RPS13_net$colors[which(colnames(RPS13_expDat) == "FBgn0010265")])
+
+RPS13_ModuleGenes <- colnames(RPS13_expDat)[RPS13_net$colors == RPS13_Module]
+connectivity_RPS13_Module <- data.frame(kWithin = RPS13_Alldegrees[RPS13_ModuleGenes,"kWithin"], gene_id = rownames(RPS13_Alldegrees[RPS13_ModuleGenes,]), moduleMembership = RPS13_geneModuleMembership[RPS13_ModuleGenes, paste0("ME",RPS13_Module)]) %>% left_join(Fly_go, by = "gene_id")
+```
+
+### The _RpS19b_-sensitive module
+
+```{r}
+RPS19b_softpower<- softP(RPS19b_expDat)
+RPS19b_Alldegrees <- intramodularConnectivity.fromExpr(RPS19b_expDat,RPS19b_net$colors, power = RPS19b_softpower)
+rownames(RPS19b_Alldegrees) <- colnames(RPS19b_expDat)
+RPS19b_geneModuleMembership <- as.data.frame(cor(RPS19b_expDat, RPS19b_MEs, use = "p"));
+
+#Isolate RpS19b gene module
+(RPS19b_Module <- RPS19b_net$colors[which(colnames(RPS19b_expDat) == "FBgn0039129")])
+
+RPS19b_ModuleGenes <- colnames(RPS19b_expDat)[RPS19b_net$colors == RPS19b_Module]
+connectivity_RPS19b_Module <- data.frame(kWithin = RPS19b_Alldegrees[RPS19b_ModuleGenes,"kWithin"], gene_id = rownames(RPS19b_Alldegrees[RPS19b_ModuleGenes,]), moduleMembership = RPS19b_geneModuleMembership[RPS19b_ModuleGenes, paste0("ME",RPS19b_Module)]) %>% left_join(Fly_go, by = "gene_id")
+```
+### The _RpL19_-sensitive module
+
+```{r}
+RPL19_softpower<- softP(RPL19_expDat)
+RPL19_Alldegrees <- intramodularConnectivity.fromExpr(RPL19_expDat,RPL19_net$colors, power = RPL19_softpower)
+rownames(RPL19_Alldegrees) <- colnames(RPL19_expDat)
+RPL19_geneModuleMembership <- as.data.frame(cor(RPL19_expDat, RPL19_MEs, use = "p"));
+
+#Isolate RpL19 gene module
+(RPL19_Module <- RPL19_net$colors[which(colnames(RPL19_expDat) == "FBgn0002607")])
+
+RPL19_ModuleGenes <- colnames(RPL19_expDat)[RPL19_net$colors == RPL19_Module]
+connectivity_RPL19_Module <- data.frame(kWithin = RPL19_Alldegrees[RPL19_ModuleGenes,"kWithin"], gene_id = rownames(RPL19_Alldegrees[RPL19_ModuleGenes,]), moduleMembership = RPL19_geneModuleMembership[RPL19_ModuleGenes, paste0("ME",RPL19_Module)]) %>% left_join(Fly_go, by = "gene_id")
+```
+
+### The _RpL24-like_-sensitive module
+
+```{r}
+RPL24_like_softpower<- softP(RPL24_like_expDat)
+RPL24_like_Alldegrees <- intramodularConnectivity.fromExpr(RPL24_like_expDat,RPL24_like_net$colors, power = RPL24_like_softpower)
+rownames(RPL24_like_Alldegrees) <- colnames(RPL24_like_expDat)
+RPL24_like_geneModuleMembership <- as.data.frame(cor(RPL24_like_expDat, RPL24_like_MEs, use = "p"));
+
+#Isolate RpL24-like gene module
+(RPL24_like_Module <- RPL24_like_net$colors[which(colnames(RPL24_like_expDat) == "FBgn0037899")])
+
+RPL24_like_ModuleGenes <- colnames(RPL24_like_expDat)[RPL24_like_net$colors == RPL24_like_Module]
+connectivity_RPL24_like_Module <- data.frame(kWithin = RPL24_like_Alldegrees[RPL24_like_ModuleGenes,"kWithin"], gene_id = rownames(RPL24_like_Alldegrees[RPL24_like_ModuleGenes,]), moduleMembership = RPL24_like_geneModuleMembership[RPL24_like_ModuleGenes, paste0("ME",RPL24_like_Module)]) %>% left_join(Fly_go, by = "gene_id")
+```
+### The _RpL30_-sensitive module
+
+```{r}
+RPL30_softpower<- softP(RPL30_expDat)
+RPL30_Alldegrees <- intramodularConnectivity.fromExpr(RPL30_expDat,RPL30_net$colors, power = RPL30_softpower)
+rownames(RPL30_Alldegrees) <- colnames(RPL30_expDat)
+RPL30_geneModuleMembership <- as.data.frame(cor(RPL30_expDat, RPL30_MEs, use = "p"));
+
+#Isolate RPL30 gene module
+(RPL30_Module <- RPL30_net$colors[which(colnames(RPL30_expDat) == "FBgn0086710")])
+
+RPL30_ModuleGenes <- colnames(RPL30_expDat)[RPL30_net$colors == RPL30_Module]
+connectivity_RPL30_Module <- data.frame(kWithin = RPL30_Alldegrees[RPL30_ModuleGenes,"kWithin"], gene_id = rownames(RPL30_Alldegrees[RPL30_ModuleGenes,]), moduleMembership = RPL30_geneModuleMembership[RPL30_ModuleGenes, paste0("ME",RPL30_Module)]) %>% left_join(Fly_go, by = "gene_id")
+```
+##  5- Module preservation (pairwise comparison between two RNAi lines) {.tabset .tabset-fade}
+
+To assess the preservation of hub genes between all treatment groups, we used funtion "modulePreservation" from the WGCNA package.
+
+### Module preservation: RpL3 and RpL14
+
+```{r, eval=FALSE}
+setLabels <- c("RPL3", "RPL14")
+
+RPL3_ggs <- goodSamplesGenes(RPL3_expDat)
+RPL14_ggs <- goodSamplesGenes(RPL14_expDat)
+RPL3_RPL14_multiExpr <- list(RPL3 = list(data = RPL3_expDat[,RPL3_ggs$goodGenes]), RPL14 = list(data = RPL14_expDat[,RPL14_ggs$goodGenes]))
+RPL3_RPL14_multiColor <- list(RPL3 = factor(labels2colors(RPL3_net$colors[RPL3_ggs$goodGenes])), RPL14 = factor(labels2colors(RPL14_net$colors[RPL14_ggs$goodGenes])))
+
+#Module preservation
+
+RPL3_RPL14_mp<- modulePreservation(RPL3_RPL14_multiExpr, RPL3_RPL14_multiColor,referenceNetworks=1,verbose=3,networkType="signed",nPermutations=500,maxGoldModuleSize=100,maxModuleSize=400)
+```
+```{r}
+#_P-value_
+
+RPL3_RPL14_mp_stats=exp(RPL3_RPL14_mp$preservation$log.p$ref.RPL3$inColumnsAlsoPresentIn.RPL14[labels2colors(RPL3_Module),"log.psummary.pres"])
+RPL3_RPL14_mp_statsZ = RPL3_RPL14_mp$preservation$Z$ref.RPL3$inColumnsAlsoPresentIn.RPL14[labels2colors(RPL3_Module),"Zsummary.pres"]
+
+RPs_modulep <- as.data.frame(matrix(ncol=7, nrow=7)) #create data table 
+rownames(RPs_modulep)=c("RpL3", "RpL14", "RpS13", "RpL9b", "RpL19","RpL24-like", "RpL30")
+names(RPs_modulep)=c("RpL3", "RpL14", "RpS13", "RpL9b", "RpL19","RpL24-like", "RpL30")
+
+RPs_modulep$RpL3[2]=RPL3_RPL14_mp_statsZ
+RPs_modulep$RpL14[1]=RPL3_RPL14_mp_stats
+
+```
+
+### Module preservation: RpL3 and RpS13
+
+```{r, eval=FALSE}
+setLabels <- c("RPL3", "RPS13")
+
+RPL3_ggs <- goodSamplesGenes(RPL3_expDat)
+RPS13_ggs <- goodSamplesGenes(RPS13_expDat)
+RPL3_RPS13_multiExpr <- list(RPL3 = list(data = RPL3_expDat[,RPL3_ggs$goodGenes]), RPS13 = list(data = RPS13_expDat[,RPS13_ggs$goodGenes]))
+RPL3_RPS13_multiColor <- list(RPL3 = factor(labels2colors(RPL3_net$colors[RPL3_ggs$goodGenes])), RPS13 = factor(labels2colors(RPS13_net$colors[RPS13_ggs$goodGenes])))
+
+#Module preservation
+
+RPL3_RPS13_mp <- modulePreservation(RPL3_RPS13_multiExpr, RPL3_RPS13_multiColor,referenceNetworks=1,verbose=3,networkType="signed",nPermutations=500,maxGoldModuleSize=100,maxModuleSize=400)
+```
+```{r}
+#_P-value_
+RPL3_RPS13_mp_stats=exp(RPL3_RPS13_mp$preservation$log.p$ref.RPL3$inColumnsAlsoPresentIn.RPS13[labels2colors(RPL3_Module),"log.psummary.pres"])
+RPL3_RPS13_mp_statsZ = RPL3_RPS13_mp$preservation$Z$ref.RPL3$inColumnsAlsoPresentIn.RPS13[labels2colors(RPL3_Module),"Zsummary.pres"]
+
+RPs_modulep$RpL3[3]=RPL3_RPS13_mp_statsZ
+RPs_modulep$RpS13[1]=RPL3_RPS13_mp_stats
+```
+
+### Module preservation: RpL3 and RpS19b
+
+```{r, eval=FALSE}
+setLabels <- c("RPL3", "RPS19b")
+
+RPL3_ggs <- goodSamplesGenes(RPL3_expDat)
+RPS19b_ggs <- goodSamplesGenes(RPS19b_expDat)
+RPL3_RPS19b_multiExpr <- list(RPL3 = list(data = RPL3_expDat[,RPL3_ggs$goodGenes]), RPS19b = list(data = RPS19b_expDat[,RPS19b_ggs$goodGenes]))
+RPL3_RPS19b_multiColor <- list(RPL3 = factor(labels2colors(RPL3_net$colors[RPL3_ggs$goodGenes])), RPS19b = factor(labels2colors(RPS19b_net$colors[RPS19b_ggs$goodGenes])))
+
+#Module preservation
+
+RPL3_RPS19b_mp <- modulePreservation(RPL3_RPS19b_multiExpr, RPL3_RPS19b_multiColor,referenceNetworks=1,verbose=3,networkType="signed",nPermutations=500,maxGoldModuleSize=100,maxModuleSize=400)
+```
+```{r}
+#_P-value_
+
+
+RPL3_RPS19b_mp_stats=exp(RPL3_RPS19b_mp$preservation$log.p$ref.RPL3$inColumnsAlsoPresentIn.RPS19b[labels2colors(RPL3_Module),"log.psummary.pres"])
+RPL3_RPS19b_mp_statsZ = RPL3_RPS19b_mp$preservation$Z$ref.RPL3$inColumnsAlsoPresentIn.RPS19b[labels2colors(RPL3_Module),"Zsummary.pres"]
+
+RPs_modulep$RpL3[4]=RPL3_RPS19b_mp_statsZ
+RPs_modulep$RpL9b[1]=RPL3_RPS19b_mp_stats
+```
+### Module preservation: RpL3 and RpL19
+
+```{r, eval=FALSE}
+setLabels <- c("RPL3", "RPL19")
+
+RPL3_ggs <- goodSamplesGenes(RPL3_expDat)
+RPL19_ggs <- goodSamplesGenes(RPL19_expDat)
+RPL3_RPL19_multiExpr <- list(RPL3 = list(data = RPL3_expDat[,RPL3_ggs$goodGenes]), RPL19 = list(data = RPL19_expDat[,RPL19_ggs$goodGenes]))
+RPL3_RPL19_multiColor <- list(RPL3 = factor(labels2colors(RPL3_net$colors[RPL3_ggs$goodGenes])), RPL19 = factor(labels2colors(RPL19_net$colors[RPL19_ggs$goodGenes])))
+
+#Module preservation
+
+RPL3_RPL19_mp <- modulePreservation(RPL3_RPL19_multiExpr, RPL3_RPL19_multiColor,referenceNetworks=1,verbose=3,networkType="signed",nPermutations=500,maxGoldModuleSize=100,maxModuleSize=400)
+```
+```{r}
+#_P-value_
+
+RPL3_RPL19_mp_stats=exp(RPL3_RPL19_mp$preservation$log.p$ref.RPL3$inColumnsAlsoPresentIn.RPL19[labels2colors(RPL3_Module),"log.psummary.pres"])
+RPL3_RPL19_mp_statsZ = RPL3_RPL19_mp$preservation$Z$ref.RPL3$inColumnsAlsoPresentIn.RPL19[labels2colors(RPL3_Module),"Zsummary.pres"]
+
+RPs_modulep$RpL3[5]=RPL3_RPL19_mp_statsZ
+RPs_modulep$RpL19[1]=RPL3_RPL19_mp_stats
+```
+
+### Module preservation: RpL3 and RpL24-like
+
+```{r, eval=FALSE}
+setLabels <- c("RPL3", "RPL24_like")
+
+RPL3_ggs <- goodSamplesGenes(RPL3_expDat)
+RPL24_like_ggs <- goodSamplesGenes(RPL24_like_expDat)
+RPL3_RPL24_like_multiExpr <- list(RPL3 = list(data = RPL3_expDat[,RPL3_ggs$goodGenes]), RPL24_like = list(data = RPL24_like_expDat[,RPL24_like_ggs$goodGenes]))
+RPL3_RPL24_like_multiColor <- list(RPL3 = factor(labels2colors(RPL3_net$colors[RPL3_ggs$goodGenes])), RPL24_like = factor(labels2colors(RPL24_like_net$colors[RPL24_like_ggs$goodGenes])))
+
+#Module preservation
+
+RPL3_RPL24_like_mp <- modulePreservation(RPL3_RPL24_like_multiExpr, RPL3_RPL24_like_multiColor,referenceNetworks=1,verbose=3,networkType="signed",nPermutations=500,maxGoldModuleSize=100,maxModuleSize=400)
+```
+```{r}
+#_P-value_
+
+
+RPL3_RPL24_like_mp_stats=exp(RPL3_RPL24_like_mp$preservation$log.p$ref.RPL3$inColumnsAlsoPresentIn.RPL24[labels2colors(RPL3_Module),"log.psummary.pres"])
+RPL3_RPL24_like_mp_statsZ = RPL3_RPL24_like_mp$preservation$Z$ref.RPL3$inColumnsAlsoPresentIn.RPL24[labels2colors(RPL3_Module),"Zsummary.pres"]
+
+RPs_modulep$RpL3[6]=RPL3_RPL24_like_mp_statsZ
+RPs_modulep$'RpL24-like'[1]=RPL3_RPL24_like_mp_stats
+
+```
+### Module preservation: RpL3 and RPL30
+
+```{r, eval=FALSE}
+setLabels <- c("RPL3", "RPL30")
+
+RPL3_ggs <- goodSamplesGenes(RPL3_expDat)
+RPL30_ggs <- goodSamplesGenes(RPL30_expDat)
+RPL3_RPL30_multiExpr <- list(RPL3 = list(data = RPL3_expDat[,RPL3_ggs$goodGenes]), RPL30 = list(data = RPL30_expDat[,RPL30_ggs$goodGenes]))
+RPL3_RPL30_multiColor <- list(RPL3 = factor(labels2colors(RPL3_net$colors[RPL3_ggs$goodGenes])), RPL30 = factor(labels2colors(RPL30_net$colors[RPL30_ggs$goodGenes])))
+
+#Module preservation
+
+RPL3_RPL30_mp <- modulePreservation(RPL3_RPL30_multiExpr, RPL3_RPL30_multiColor,referenceNetworks=1,verbose=3,networkType="signed",nPermutations=500,maxGoldModuleSize=100,maxModuleSize=400)
+```
+```{r}
+#_P-value_
+
+RPL3_RPL30_mp_stats=exp(RPL3_RPL30_mp$preservation$log.p$ref.RPL3$inColumnsAlsoPresentIn.RPL30[labels2colors(RPL3_Module),"log.psummary.pres"])
+RPL3_RPL30_mp_statsZ = RPL3_RPL30_mp$preservation$Z$ref.RPL3$inColumnsAlsoPresentIn.RPL30[labels2colors(RPL3_Module),"Zsummary.pres"]
+
+RPs_modulep$RpL3[7]=RPL3_RPL30_mp_statsZ
+RPs_modulep$RpL30[1]=RPL3_RPL30_mp_stats
+```
+
+### Module preservation: RpL14 and RpS13
+
+```{r, eval=FALSE}
+setLabels <- c("RPL14", "RPS13")
+
+RPL14_ggs <- goodSamplesGenes(RPL14_expDat)
+RPS13_ggs <- goodSamplesGenes(RPS13_expDat)
+RPL14_RPS13_multiExpr <- list(RPL14 = list(data = RPL14_expDat[,RPL14_ggs$goodGenes]), RPS13 = list(data = RPS13_expDat[,RPS13_ggs$goodGenes]))
+RPL14_RPS13_multiColor <- list(RPL14 = factor(labels2colors(RPL14_net$colors[RPL14_ggs$goodGenes])), RPS13 = factor(labels2colors(RPS13_net$colors[RPS13_ggs$goodGenes])))
+
+#Module preservation
+
+RPL14_RPS13_mp <- modulePreservation(RPL14_RPS13_multiExpr, RPL14_RPS13_multiColor,referenceNetworks=1,verbose=3,networkType="signed",nPermutations=500,maxGoldModuleSize=100,maxModuleSize=400)
+```
+```{r}
+#_P-value_
+RPL14_RPS13_mp_stats=exp(RPL14_RPS13_mp$preservation$log.p$ref.RPL14$inColumnsAlsoPresentIn.RPS13[labels2colors(RPL14_Module),"log.psummary.pres"])
+RPL14_RPS13_mp_statsZ = RPL14_RPS13_mp$preservation$Z$ref.RPL14$inColumnsAlsoPresentIn.RPS13[labels2colors(RPL14_Module),"Zsummary.pres"]
+
+RPs_modulep$RpL14[3]=RPL14_RPS13_mp_statsZ
+RPs_modulep$RpS13[2]=RPL14_RPS13_mp_stats
+```
+
+### Module preservation: RpL14 and RpS19b
+
+```{r, eval=FALSE}
+setLabels <- c("RPL14", "RPS19b")
+
+RPL14_ggs <- goodSamplesGenes(RPL14_expDat)
+RPS19b_ggs <- goodSamplesGenes(RPS19b_expDat)
+RPL14_RPS19b_multiExpr <- list(RPL14 = list(data = RPL14_expDat[,RPL14_ggs$goodGenes]), RPS19b = list(data = RPS19b_expDat[,RPS19b_ggs$goodGenes]))
+RPL14_RPS19b_multiColor <- list(RPL14 = factor(labels2colors(RPL14_net$colors[RPL14_ggs$goodGenes])), RPS19b = factor(labels2colors(RPS19b_net$colors[RPS19b_ggs$goodGenes])))
+
+#Module preservation
+
+RPL14_RPS19b_mp <- modulePreservation(RPL14_RPS19b_multiExpr, RPL14_RPS19b_multiColor,referenceNetworks=1,verbose=3,networkType="signed",nPermutations=500,maxGoldModuleSize=100,maxModuleSize=400)
+```
+```{r}
+#_P-value_
+
+RPL14_RPS19b_mp_stats=exp(RPL14_RPS19b_mp$preservation$log.p$ref.RPL14$inColumnsAlsoPresentIn.RPS19b[labels2colors(RPL14_Module),"log.psummary.pres"])
+RPL14_RPS19b_mp_statsZ = RPL14_RPS19b_mp$preservation$Z$ref.RPL14$inColumnsAlsoPresentIn.RPS19b[labels2colors(RPL14_Module),"Zsummary.pres"]
+
+RPs_modulep$RpL14[4]=RPL14_RPS19b_mp_statsZ
+RPs_modulep$RpL9b[2]=RPL14_RPS19b_mp_stats
+```
+
+### Module preservation: RpL14 and RpL19
+
+```{r, eval=FALSE}
+setLabels <- c("RPL14", "RPL19")
+
+RPL14_ggs <- goodSamplesGenes(RPL14_expDat)
+RPL19_ggs <- goodSamplesGenes(RPL19_expDat)
+RPL14_RPL19_multiExpr <- list(RPL14 = list(data = RPL14_expDat[,RPL14_ggs$goodGenes]), RPL19 = list(data = RPL19_expDat[,RPL19_ggs$goodGenes]))
+RPL14_RPL19_multiColor <- list(RPL14 = factor(labels2colors(RPL14_net$colors[RPL14_ggs$goodGenes])), RPL19 = factor(labels2colors(RPL19_net$colors[RPL19_ggs$goodGenes])))
+
+#Module preservation
+
+RPL14_RPL19_mp <- modulePreservation(RPL14_RPL19_multiExpr, RPL14_RPL19_multiColor,referenceNetworks=1,verbose=3,networkType="signed",nPermutations=500,maxGoldModuleSize=100,maxModuleSize=400)
+```
+```{r}
+#_P-value_
+
+RPL14_RPL19_mp_stats=exp(RPL14_RPL19_mp$preservation$log.p$ref.RPL14$inColumnsAlsoPresentIn.RPL19[labels2colors(RPL14_Module),"log.psummary.pres"])
+RPL14_RPL19_mp_statsZ = RPL14_RPL19_mp$preservation$Z$ref.RPL14$inColumnsAlsoPresentIn.RPL19[labels2colors(RPL14_Module),"Zsummary.pres"]
+
+RPs_modulep$RpL14[5]=RPL14_RPL19_mp_statsZ
+RPs_modulep$RpL19[2]=RPL14_RPL19_mp_stats
+
+```
+### Module preservation: RpL14 and RPL24-like
+
+```{r, eval=FALSE}
+setLabels <- c("RPL14", "RPL24_like")
+
+RPL14_ggs <- goodSamplesGenes(RPL14_expDat)
+RPL24_like_ggs <- goodSamplesGenes(RPL24_like_expDat)
+RPL14_RPL24_like_multiExpr <- list(RPL14 = list(data = RPL14_expDat[,RPL14_ggs$goodGenes]), RPL24_like = list(data = RPL24_like_expDat[,RPL24_like_ggs$goodGenes]))
+RPL14_RPL24_like_multiColor <- list(RPL14 = factor(labels2colors(RPL14_net$colors[RPL14_ggs$goodGenes])), RPL24_like = factor(labels2colors(RPL24_like_net$colors[RPL24_like_ggs$goodGenes])))
+
+#Module preservation
+
+RPL14_RPL24_like_mp <- modulePreservation(RPL14_RPL24_like_multiExpr, RPL14_RPL24_like_multiColor,referenceNetworks=1,verbose=3,networkType="signed",nPermutations=500,maxGoldModuleSize=100,maxModuleSize=400)
+```
+```{r}
+#_P-value_
+
+RPL14_RPL24_like_mp_stats=exp(RPL14_RPL24_like_mp$preservation$log.p$ref.RPL14$inColumnsAlsoPresentIn.RPL24_like[labels2colors(RPL14_Module),"log.psummary.pres"])
+RPL14_RPL24_like_mp_statsZ = RPL14_RPL24_like_mp$preservation$Z$ref.RPL14$inColumnsAlsoPresentIn.RPL24_like[labels2colors(RPL14_Module),"Zsummary.pres"]
+
+RPs_modulep$RpL14[6]=RPL14_RPL24_like_mp_statsZ
+RPs_modulep$'RpL24-like'[2]=RPL14_RPL24_like_mp_stats
+
+```
+
+### Module preservation: RPL14 and RPL30
+
+```{r, eval=FALSE}
+setLabels <- c("RPL14", "RPL30")
+
+RPL14_ggs <- goodSamplesGenes(RPL14_expDat)
+RPL30_ggs <- goodSamplesGenes(RPL30_expDat)
+RPL14_RPL30_multiExpr <- list(RPL14 = list(data = RPL14_expDat[,RPL14_ggs$goodGenes]), RPL30 = list(data = RPL30_expDat[,RPL30_ggs$goodGenes]))
+RPL14_RPL30_multiColor <- list(RPL14 = factor(labels2colors(RPL14_net$colors[RPL14_ggs$goodGenes])), RPL30 = factor(labels2colors(RPL30_net$colors[RPL30_ggs$goodGenes])))
+
+#Module preservation
+
+RPL14_RPL30_mp <- modulePreservation(RPL14_RPL30_multiExpr, RPL14_RPL30_multiColor,referenceNetworks=1,verbose=3,networkType="signed",nPermutations=500,maxGoldModuleSize=100,maxModuleSize=400)
+```
+```{r}
+#_P-value_
+
+RPL14_RPL30_mp_stats=exp(RPL14_RPL30_mp$preservation$log.p$ref.RPL14$inColumnsAlsoPresentIn.RPL30[labels2colors(RPL14_Module),"log.psummary.pres"])
+RPL14_RPL30_mp_statsZ = RPL14_RPL30_mp$preservation$Z$ref.RPL14$inColumnsAlsoPresentIn.RPL30[labels2colors(RPL14_Module),"Zsummary.pres"]
+
+RPs_modulep$RpL14[7]=RPL14_RPL30_mp_statsZ
+RPs_modulep$RpL30[2]=RPL14_RPL30_mp_stats
+
+```
+
+### Module preservation: RpS13 and RpS19b
+
+```{r, eval=FALSE}
+setLabels <- c("RPS13", "RPS19b")
+
+RPS13_ggs <- goodSamplesGenes(RPS13_expDat)
+RPS19b_ggs <- goodSamplesGenes(RPS19b_expDat)
+RPS13_RPS19b_multiExpr <- list(RPS13 = list(data = RPS13_expDat[,RPS13_ggs$goodGenes]), RPS19b = list(data = RPS19b_expDat[,RPS19b_ggs$goodGenes]))
+RPS13_RPS19b_multiColor <- list(RPS13 = factor(labels2colors(RPS13_net$colors[RPS13_ggs$goodGenes])), RPS19b = factor(labels2colors(RPS19b_net$colors[RPS19b_ggs$goodGenes])))
+
+#Module preservation
+
+RPS13_RPS19b_mp <- modulePreservation(RPS13_RPS19b_multiExpr, RPS13_RPS19b_multiColor,referenceNetworks=1,verbose=3,networkType="signed",nPermutations=500,maxGoldModuleSize=100,maxModuleSize=400)
+```
+```{r}
+#_P-value_
+
+RPS13_RPS19b_mp_stats=exp(RPS13_RPS19b_mp$preservation$log.p$ref.RPS13$inColumnsAlsoPresentIn.RPS19b[labels2colors(RPS13_Module),"log.psummary.pres"])
+RPS13_RPS19b_mp_statsZ = RPS13_RPS19b_mp$preservation$Z$ref.RPS13$inColumnsAlsoPresentIn.RPS19b[labels2colors(RPS13_Module),"Zsummary.pres"]
+
+
+RPs_modulep$RpS13[4]=RPS13_RPS19b_mp_statsZ
+RPs_modulep$RpL9b[3]=RPS13_RPS19b_mp_stats
+
+```
+
+### Module preservation: RpS13 and RpL19
+
+```{r, eval=FALSE}
+setLabels <- c("RPS13", "RPL19")
+
+RPS13_ggs <- goodSamplesGenes(RPS13_expDat)
+RPL19_ggs <- goodSamplesGenes(RPL19_expDat)
+RPS13_RPL19_multiExpr <- list(RPS13 = list(data = RPS13_expDat[,RPS13_ggs$goodGenes]), RPL19 = list(data = RPL19_expDat[,RPL19_ggs$goodGenes]))
+RPS13_RPL19_multiColor <- list(RPS13 = factor(labels2colors(RPS13_net$colors[RPS13_ggs$goodGenes])), RPL19 = factor(labels2colors(RPL19_net$colors[RPL19_ggs$goodGenes])))
+#Module preservation
+RPS13_RPL19_mp <- modulePreservation(RPS13_RPL19_multiExpr, RPS13_RPL19_multiColor,referenceNetworks=1,verbose=3,networkType="signed",nPermutations=500,maxGoldModuleSize=100,maxModuleSize=400)
+```
+```{r}
+#_P-value_
+
+RPS13_RPL19_mp_stats=exp(RPS13_RPL19_mp$preservation$log.p$ref.RPS13$inColumnsAlsoPresentIn.RPL19[labels2colors(RPS13_Module),"log.psummary.pres"])
+RPS13_RPL19_mp_statsZ = RPS13_RPL19_mp$preservation$Z$ref.RPS13$inColumnsAlsoPresentIn.RPL19[labels2colors(RPS13_Module),"Zsummary.pres"]
+
+RPs_modulep$RpS13[5]=RPS13_RPL19_mp_statsZ
+RPs_modulep$RpL19[3]=RPS13_RPL19_mp_stats
+```
+
+### Module preservation: RpS13 and RpL24-like
+
+```{r, eval=FALSE}
+setLabels <- c("RPS13", "RPL24_like")
+
+RPS13_ggs <- goodSamplesGenes(RPS13_expDat)
+RPL24_like_ggs <- goodSamplesGenes(RPL24_like_expDat)
+RPS13_RPL24_like_multiExpr <- list(RPS13 = list(data = RPS13_expDat[,RPS13_ggs$goodGenes]), RPL24_like = list(data = RPL24_like_expDat[,RPL24_like_ggs$goodGenes]))
+RPS13_RPL24_like_multiColor <- list(RPS13 = factor(labels2colors(RPS13_net$colors[RPS13_ggs$goodGenes])), RPL24_like = factor(labels2colors(RPL24_like_net$colors[RPL24_like_ggs$goodGenes])))
+
+#Module preservation
+
+RPS13_RPL24_like_mp <- modulePreservation(RPS13_RPL24_like_multiExpr, RPS13_RPL24_like_multiColor,referenceNetworks=1,verbose=3,networkType="signed",nPermutations=500,maxGoldModuleSize=100,maxModuleSize=400)
+```
+```{r}
+#_P-value_
+
+RPS13_RPL24_like_mp_stats=exp(RPS13_RPL24_like_mp$preservation$log.p$ref.RPS13$inColumnsAlsoPresentIn.RPL24_like[labels2colors(RPS13_Module),"log.psummary.pres"])
+RPS13_RPL24_like_mp_statsZ = RPS13_RPL24_like_mp$preservation$Z$ref.RPS13$inColumnsAlsoPresentIn.RPL24_like[labels2colors(RPS13_Module),"Zsummary.pres"]
+
+RPs_modulep$RpS13[6]=RPS13_RPL24_like_mp_statsZ
+RPs_modulep$'RpL24-like'[3]=RPS13_RPL24_like_mp_stats
+```
+
+### Module preservation: RpS13 and RPL30
+
+```{r, eval=FALSE}
+setLabels <- c("RPS13", "RPL30")
+
+RPS13_ggs <- goodSamplesGenes(RPS13_expDat)
+RPL30_ggs <- goodSamplesGenes(RPL30_expDat)
+RPS13_RPL30_multiExpr <- list(RPS13 = list(data = RPS13_expDat[,RPS13_ggs$goodGenes]), RPL30 = list(data = RPL30_expDat[,RPL30_ggs$goodGenes]))
+RPS13_RPL30_multiColor <- list(RPS13 = factor(labels2colors(RPS13_net$colors[RPS13_ggs$goodGenes])), RPL30 = factor(labels2colors(RPL30_net$colors[RPL30_ggs$goodGenes])))
+
+#Module preservation
+
+RPS13_RPL30_mp <- modulePreservation(RPS13_RPL30_multiExpr, RPS13_RPL30_multiColor,referenceNetworks=1,verbose=3,networkType="signed",nPermutations=500,maxGoldModuleSize=100,maxModuleSize=400)
+```
+```{r}
+#_P-value_
+
+RPS13_RPL30_mp_stats=exp(RPS13_RPL30_mp$preservation$log.p$ref.RPS13$inColumnsAlsoPresentIn.RPL30[labels2colors(RPS13_Module),"log.psummary.pres"])
+RPS13_RPL30_mp_statsZ = RPS13_RPL30_mp$preservation$Z$ref.RPS13$inColumnsAlsoPresentIn.RPL30[labels2colors(RPS13_Module),"Zsummary.pres"]
+
+RPs_modulep$RpS13[7]=RPS13_RPL30_mp_statsZ
+RPs_modulep$RpL30[3]=RPS13_RPL30_mp_stats
+```
+
+### Module preservation: RpS19b and RpL19
+
+```{r, eval=FALSE}
+setLabels <- c("RPS19b", "RPL19")
+
+RPS19b_ggs <- goodSamplesGenes(RPS19b_expDat)
+RPL19_ggs <- goodSamplesGenes(RPL19_expDat)
+RPS19b_RPL19_multiExpr <- list(RPS19b = list(data = RPS19b_expDat[,RPS19b_ggs$goodGenes]), RPL19 = list(data = RPL19_expDat[,RPL19_ggs$goodGenes]))
+RPS19b_RPL19_multiColor <- list(RPS19b = factor(labels2colors(RPS19b_net$colors[RPS19b_ggs$goodGenes])), RPL19 = factor(labels2colors(RPL19_net$colors[RPL19_ggs$goodGenes])))
+
+#Module preservation
+
+RPS19b_RPL19_mp <- modulePreservation(RPS19b_RPL19_multiExpr, RPS19b_RPL19_multiColor,referenceNetworks=1,verbose=3,networkType="signed",nPermutations=500,maxGoldModuleSize=100,maxModuleSize=400)
+```
+```{r}
+#_P-value_
+
+RPS19b_RPL19_mp_stats=exp(RPS19b_RPL19_mp$preservation$log.p$ref.RPS19b$inColumnsAlsoPresentIn.RPL19[labels2colors(RPS19b_Module),"log.psummary.pres"])
+RPS19b_RPL19_mp_statsZ = RPS19b_RPL19_mp$preservation$Z$ref.RPS19b$inColumnsAlsoPresentIn.RPL19[labels2colors(RPS19b_Module),"Zsummary.pres"]
+
+RPs_modulep$RpL9b[5]=RPS19b_RPL19_mp_statsZ
+RPs_modulep$RpL19[4]=RPS19b_RPL19_mp_stats
+
+```
+### Module preservation: RpS19b and RpL24-like
+
+```{r, eval=FALSE}
+setLabels <- c("RPS19b", "RPL24_like")
+
+RPS19b_ggs <- goodSamplesGenes(RPS19b_expDat)
+RPL24_like_ggs <- goodSamplesGenes(RPL24_like_expDat)
+RPS19b_RPL24_like_multiExpr <- list(RPS19b = list(data = RPS19b_expDat[,RPS19b_ggs$goodGenes]), RPL24_like = list(data = RPL24_like_expDat[,RPL24_like_ggs$goodGenes]))
+RPS19b_RPL24_like_multiColor <- list(RPS19b = factor(labels2colors(RPS19b_net$colors[RPS19b_ggs$goodGenes])), RPL24_like = factor(labels2colors(RPL24_like_net$colors[RPL24_like_ggs$goodGenes])))
+
+#Module preservation
+
+RPS19b_RPL24_like_mp <- modulePreservation(RPS19b_RPL24_like_multiExpr, RPS19b_RPL24_like_multiColor,referenceNetworks=1,verbose=3,networkType="signed",nPermutations=500,maxGoldModuleSize=100,maxModuleSize=400)
+```
+```{r}
+#_P-value_
+
+RPS19b_RPL24_like_mp_stats=exp(RPS19b_RPL24_like_mp$preservation$log.p$ref.RPS19b$inColumnsAlsoPresentIn.RPL24_like[labels2colors(RPS19b_Module),"log.psummary.pres"])
+RPS19b_RPL24_like_mp_statsZ = RPS19b_RPL24_like_mp$preservation$Z$ref.RPS19b$inColumnsAlsoPresentIn.RPL24_like[labels2colors(RPS19b_Module),"Zsummary.pres"]
+
+RPs_modulep$RpL9b[6]=RPS19b_RPL24_like_mp_statsZ
+RPs_modulep$'RpL24-like'[4]=RPS19b_RPL24_like_mp_stats
+
+```
+
+### Module preservation: RpS19b and RPL30
+
+```{r, eval=FALSE}
+setLabels <- c("RPS19b", "RPL30")
+
+RPS19b_ggs <- goodSamplesGenes(RPS19b_expDat)
+RPL30_ggs <- goodSamplesGenes(RPL30_expDat)
+RPS19b_RPL30_multiExpr <- list(RPS19b = list(data = RPS19b_expDat[,RPS19b_ggs$goodGenes]), RPL30 = list(data = RPL30_expDat[,RPL30_ggs$goodGenes]))
+RPS19b_RPL30_multiColor <- list(RPS19b = factor(labels2colors(RPS19b_net$colors[RPS19b_ggs$goodGenes])), RPL30 = factor(labels2colors(RPL30_net$colors[RPL30_ggs$goodGenes])))
+#Module preservation
+RPS19b_RPL30_mp <- modulePreservation(RPS19b_RPL30_multiExpr, RPS19b_RPL30_multiColor,referenceNetworks=1,verbose=3,networkType="signed",nPermutations=500,maxGoldModuleSize=100,maxModuleSize=400)
+```
+```{r}
+#_P-value_
+
+RPS19b_RPL30_mp_stats=exp(RPS19b_RPL30_mp$preservation$log.p$ref.RPS19b$inColumnsAlsoPresentIn.RPL30[labels2colors(RPS19b_Module),"log.psummary.pres"])
+RPS19b_RPL30_mp_statsZ = RPS19b_RPL30_mp$preservation$Z$ref.RPS19b$inColumnsAlsoPresentIn.RPL30[labels2colors(RPS19b_Module),"Zsummary.pres"]
+
+RPs_modulep$RpL9b[7]=RPS19b_RPL30_mp_statsZ
+RPs_modulep$RpL30[4]=RPS19b_RPL30_mp_stats
+
+```
+
+### Module preservation: RpL19 and RpL24-like
+
+```{r, eval=FALSE}
+setLabels <- c("RPL19", "RPL24_like")
+
+RPL19_ggs <- goodSamplesGenes(RPL19_expDat)
+RPL24_like_ggs <- goodSamplesGenes(RPL24_like_expDat)
+RPL19_RPL24_like_multiExpr <- list(RPL19 = list(data = RPL19_expDat[,RPL19_ggs$goodGenes]), RPL24_like = list(data = RPL24_like_expDat[,RPL24_like_ggs$goodGenes]))
+RPL19_RPL24_like_multiColor <- list(RPL19 = factor(labels2colors(RPL19_net$colors[RPL19_ggs$goodGenes])), RPL24_like = factor(labels2colors(RPL24_like_net$colors[RPL24_like_ggs$goodGenes])))
+#Module preservation
+
+RPL19_RPL24_like_mp <- modulePreservation(RPL19_RPL24_like_multiExpr, RPL19_RPL24_like_multiColor,referenceNetworks=1,verbose=3,networkType="signed",nPermutations=500,maxGoldModuleSize=100,maxModuleSize=400)
+```
+```{r}
+#_P-value_
+
+RPL19_RPL24_like_mp_stats=exp(RPL19_RPL24_like_mp$preservation$log.p$ref.RPL19$inColumnsAlsoPresentIn.RPL24_like[labels2colors(RPL19_Module),"log.psummary.pres"])
+RPL19_RPL24_like_mp_statsZ = RPL19_RPL24_like_mp$preservation$Z$ref.RPL19$inColumnsAlsoPresentIn.RPL24_like[labels2colors(RPL19_Module),"Zsummary.pres"]
+
+RPs_modulep$RpL19[6]=RPL19_RPL24_like_mp_statsZ
+RPs_modulep$'RpL24-like'[5]=RPL19_RPL24_like_mp_stats
+
+```
+
+### Module preservation: RpL19 and RPL30
+
+```{r, eval=FALSE}
+setLabels <- c("RPL19", "RPL30")
+
+RPL19_ggs <- goodSamplesGenes(RPL19_expDat)
+RPL30_ggs <- goodSamplesGenes(RPL30_expDat)
+RPL19_RPL30_multiExpr <- list(RPL19 = list(data = RPL19_expDat[,RPL19_ggs$goodGenes]), RPL30 = list(data = RPL30_expDat[,RPL30_ggs$goodGenes]))
+RPL19_RPL30_multiColor <- list(RPL19 = factor(labels2colors(RPL19_net$colors[RPL19_ggs$goodGenes])), RPL30 = factor(labels2colors(RPL30_net$colors[RPL30_ggs$goodGenes])))
+#Module preservation
+RPL19_RPL30_mp <- modulePreservation(RPL19_RPL30_multiExpr, RPL19_RPL30_multiColor,referenceNetworks=1,verbose=3,networkType="signed",nPermutations=500,maxGoldModuleSize=100,maxModuleSize=400)
+```
+```{r}
+#_P-value_
+
+RPL19_RPL30_mp_stats=exp(RPL19_RPL30_mp$preservation$log.p$ref.RPL19$inColumnsAlsoPresentIn.RPL30[labels2colors(RPL19_Module),"log.psummary.pres"])
+RPL19_RPL30_mp_statsZ = RPL19_RPL30_mp$preservation$Z$ref.RPL19$inColumnsAlsoPresentIn.RPL30[labels2colors(RPL19_Module),"Zsummary.pres"]
+
+RPs_modulep$RpL19[7]=RPL19_RPL30_mp_statsZ
+RPs_modulep$RpL30[5]=RPL19_RPL30_mp_stats
+
+```
+
+### Module preservation: RpL24-like and  RPL30
+
+```{r, eval=FALSE}
+setLabels <- c("RPL24_like", " RPL30")
+
+RPL24_like_like_ggs <- goodSamplesGenes(RPL24_like_expDat)
+RPL30_ggs <- goodSamplesGenes( RPL30_expDat)
+RPL24_like_RPL30_multiExpr <- list(RPL24_like = list(data = RPL24_like_expDat[,RPL24_like_ggs$goodGenes]),  RPL30 = list(data =  RPL30_expDat[, RPL30_ggs$goodGenes]))
+RPL24_like_RPL30_multiColor <- list(RPL24_like = factor(labels2colors(RPL24_like_net$colors[RPL24_like_ggs$goodGenes])),  RPL30 = factor(labels2colors( RPL30_net$colors[ RPL30_ggs$goodGenes])))
+#Module preservation
+RPL24_like_RPL30_mp <- modulePreservation(RPL24_like_RPL30_multiExpr, RPL24_like_RPL30_multiColor,referenceNetworks=1,verbose=3,networkType="signed",nPermutations=500,maxGoldModuleSize=100,maxModuleSize=400)
+```
+```{r}
+#_P-value_
+RPL24_like_RPL30_mp_stats=exp(RPL24_like_RPL30_mp$preservation$log.p$ref.RPL24_like$inColumnsAlsoPresentIn.RPL30[labels2colors(RPL24_like_Module),"log.psummary.pres"])
+RPL24_like_RPL30_mp_statsZ = RPL24_like_RPL30_mp$preservation$Z$ref.RPL24_like$inColumnsAlsoPresentIn.RPL30[labels2colors(RPL24_like_Module),"Zsummary.pres"]
+
+RPs_modulep$'RpL24-like'[7]=RPL24_like_RPL30_mp_statsZ
+RPs_modulep$RpL30[6]=RPL24_like_RPL30_mp_stats
+
+```
+
+##
+Rp Module Preservation analysis
+
+```{r results='asis'}
+RPs_modulep[RPs_modulep <0.0001] = "<0.0001"
+
+library(ztable)
+options(ztable.type="html")
+ztable(as.data.frame(RPs_modulep),digits = 5) %>%
+  print(caption=" Minute Module Preservation analysis")
+
+write_csv(RPs_modulep, "RPs_modulep.csv")
+```
+
+##  6- Visualisation of the preserved gene network between treatments {.tabset .tabset-fade}
+
+###  RpL3 and RpL14 preserved gene network
+Select genes that overlap across all studies and
+
+```{r}
+RpL3_RpL14_network <- as.data.frame(connectivity_RPL3_Module %>% filter(gene_name %in% connectivity_RPL14_Module$gene_name))
+RpL3_RpL14_network <- RpL3_RpL14_network %>% distinct(gene_id, .keep_all = TRUE) %>% drop_na(gene_name)
+dim(RpL3_RpL14_network)
+```
+
+Select genes used in this study (all RNAi lines)
+```{r}
+RpL3_RpL14_genes <- which(RpL3_RpL14_network$gene_name %in% rnai)
+RpL3_RpL14_heatshock <- which(RpL3_RpL14_network$gene_name %in% heatshock)
+```
+
+Table of associated network, highlighting the genes used in this study
+```{r, echo=F}
+RpL3_RpL14_network %>% kable(format = "html", caption = "RpL3 and RpL14 preserved gene network.") %>% row_spec(RpL3_RpL14_genes, bold = T, color = "white", background = "#1d2ad7") %>% row_spec(RpL3_RpL14_heatshock, bold = T, color = "white", background = "#D7261E")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(height = "400px")
+```
+
+###  RpL3 and RpS13 preserved gene network
+Select genes that overlap across all studies and
+
+```{r}
+RpL3_RpS13_network <- as.data.frame(connectivity_RPL3_Module %>% filter(gene_name %in% connectivity_RPS13_Module$gene_name))
+RpL3_RpS13_network<- RpL3_RpS13_network %>% distinct(gene_id, .keep_all = TRUE) %>% drop_na(gene_name)
+dim(RpL3_RpS13_network)
+```
+
+Select genes used in this study (all RNAi lines)
+```{r}
+RpL3_RpS13_genes <- which(RpL3_RpS13_network$gene_name %in% rnai)
+RpL3_RpS13_heatshock <- which(RpL3_RpS13_network$gene_name %in% heatshock)
+```
+
+Table of associated network, highlighting the genes used in this study
+```{r, echo=F}
+RpL3_RpS13_network %>% kable(format = "html", caption = "RpL3 and RpS13 preserved gene network.") %>% row_spec(RpL3_RpS13_genes, bold = T, color = "white", background = "#1d2ad7") %>% row_spec(RpL3_RpS13_heatshock, bold = T, color = "white", background = "#D7261E")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(height = "400px")
+```
+###  RpL3 and RpS19b preserved gene network
+Select genes that overlap across all studies and
+
+```{r}
+RpL3_RpS19b_network <- as.data.frame(connectivity_RPL3_Module %>% filter(gene_name %in%connectivity_RPS19b_Module$gene_name))
+RpL3_RpS19b_network <- RpL3_RpS19b_network %>% distinct(gene_id, .keep_all = TRUE) %>% drop_na(gene_name)
+dim(RpL3_RpS19b_network)
+```
+
+Select genes used in this study (all RNAi lines)
+```{r}
+RpL3_RpS19b_genes <- which(RpL3_RpS19b_network$gene_name %in% rnai)
+RpL3_RpS19b_heatshock <- which(RpL3_RpS19b_network$gene_name %in% heatshock)
+```
+
+Table of associated network, highlighting the genes used in this study
+```{r, echo=F}
+RpL3_RpS19b_network %>% kable(format = "html", caption = "RpL3 and RpS19b preserved gene network.") %>% row_spec(RpL3_RpS19b_genes, bold = T, color = "white", background = "#1d2ad7") %>% row_spec(RpL3_RpS19b_heatshock, bold = T, color = "white", background = "#D7261E")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(height = "400px")
+```
+###  RpL3 and RpL19 preserved gene network
+Select genes that overlap across all studies and
+
+```{r}
+RpL3_RpL19_network <- as.data.frame(connectivity_RPL3_Module %>% filter(gene_name %in%connectivity_RPL19_Module$gene_name))
+RpL3_RpL19_network <- RpL3_RpL19_network %>% distinct(gene_id, .keep_all = TRUE) %>% drop_na(gene_name)
+dim(RpL3_RpL19_network)
+```
+
+Select genes used in this study (all RNAi lines)
+```{r}
+RpL3_RpL19_genes <- which(RpL3_RpL19_network$gene_name %in% rnai)
+RpL3_RpL19_heatshock <- which(RpL3_RpL19_network$gene_name %in% heatshock)
+```
+
+Table of associated network, highlighting the genes used in this study
+```{r, echo=F}
+RpL3_RpL19_network %>% kable(format = "html", caption = "RpL3 and RpL19 preserved gene network.") %>% row_spec(RpL3_RpL19_genes, bold = T, color = "white", background = "#1d2ad7") %>% row_spec(RpL3_RpL19_heatshock, bold = T, color = "white", background = "#D7261E")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(height = "400px")
+```
+
+###  RpL3 and RpL30  preserved gene network
+Select genes that overlap across all studies and
+
+```{r}
+RpL3_RpL30_network <- as.data.frame(connectivity_RPL3_Module %>% filter(gene_name %in%connectivity_RPL30_Module$gene_name))
+RpL3_RpL30_network <- RpL3_RpL30_network %>% distinct(gene_id, .keep_all = TRUE) %>% drop_na(gene_name) %>% drop_na(gene_name)
+dim(RpL3_RpL30_network)
+```
+
+Select genes used in this study (all RNAi lines)
+```{r}
+RpL3_RpL30_genes <- which(RpL3_RpL30_network$gene_name %in% rnai)
+RpL3_RpL30_heatshock <- which(RpL3_RpL30_network$gene_name %in% heatshock)
+```
+
+Table of associated network, highlighting the genes used in this study
+```{r , echo=F}
+RpL3_RpL30_network %>% kable(format = "html", caption = "RpL3 and RpL30 preserved gene network.") %>% row_spec(RpL3_RpL30_genes, bold = T, color = "white", background = "#1d2ad7") %>% row_spec(RpL3_RpL30_heatshock, bold = T, color = "white", background = "#D7261E")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(height = "400px")
+```
+
+###  RpL14 and RpS13  preserved gene network
+Select genes that overlap across all studies and
+
+```{r}
+RpL14_RpS13_network <- as.data.frame(connectivity_RPL14_Module %>% filter(gene_name %in% connectivity_RPS13_Module$gene_name))
+RpL14_RpS13_network <- RpL14_RpS13_network %>% distinct(gene_id, .keep_all = TRUE) %>% drop_na(gene_name) %>% drop_na(gene_name)
+dim(RpL14_RpS13_network)
+```
+
+Select genes used in this study (all RNAi lines)
+```{r}
+RpL14_RpS13_genes <- which(RpL14_RpS13_network$gene_name %in% rnai)
+RpL14_RpS13_heatshock <- which(RpL14_RpS13_network$gene_name %in% heatshock)
+```
+
+Table of associated network, highlighting the genes used in this study
+```{r , echo=F}
+RpL14_RpS13_network %>% kable(format = "html", caption = "RpL14 and RpS13 preserved gene network.") %>% row_spec(RpL14_RpS13_genes, bold = T, color = "white", background = "#1d2ad7") %>% row_spec(RpL14_RpS13_heatshock, bold = T, color = "white", background = "#D7261E")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(height = "400px")
+```
+
+###  RpL14 and RpL19  preserved gene network
+Select genes that overlap across all studies and
+
+```{r}
+RpL14_RpL19_network <- as.data.frame(connectivity_RPL14_Module %>% filter(gene_name %in% connectivity_RPL19_Module$gene_name))
+RpL14_RpL19_network <- RpL14_RpL19_network %>% distinct(gene_id, .keep_all = TRUE) %>% drop_na(gene_name) %>% drop_na(gene_name)
+dim(RpL14_RpL19_network)
+```
+
+Select genes used in this study (all RNAi lines)
+```{r}
+RpL14_RpL19_genes <- which(RpL14_RpL19_network$gene_name %in% rnai)
+RpL14_RpL19_heatshock <- which(RpL14_RpL19_network$gene_name %in% heatshock)
+```
+
+Table of associated network, highlighting the genes used in this study
+```{r , echo=F}
+RpL14_RpL19_network %>% kable(format = "html", caption = "RpL14 and RpL19 preserved gene network.") %>% row_spec(RpL14_RpL19_genes, bold = T, color = "white", background = "#1d2ad7") %>% row_spec(RpL14_RpL19_heatshock, bold = T, color = "white", background = "#D7261E")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(height = "400px")
+```
+
+###  RpL14 and RpL24-like preserved gene network
+Select genes that overlap across all studies and
+
+```{r}
+RpL14_RpL24_like_network <- as.data.frame(connectivity_RPL14_Module %>% filter(gene_name %in% connectivity_RPL24_like_Module$gene_name))
+RpL14_RpL24_like_network <- RpL14_RpL24_like_network %>% distinct(gene_id, .keep_all = TRUE) %>% drop_na(gene_name) %>% drop_na(gene_name)
+dim(RpL14_RpL24_like_network)
+```
+
+Select genes used in this study (all RNAi lines)
+```{r}
+RpL14_RpL24_like_genes <- which(RpL14_RpL24_like_network$gene_name %in% rnai)
+RpL14_RpL24_like_heatshock <- which(RpL14_RpL24_like_network$gene_name %in% heatshock)
+```
+
+Table of associated network, highlighting the genes used in this study
+```{r , echo=F}
+RpL14_RpL24_like_network %>% kable(format = "html", caption = "RpL14 and RpL24-like preserved gene network.") %>% row_spec(RpL14_RpL24_like_genes, bold = T, color = "white", background = "#1d2ad7") %>% row_spec(RpL14_RpL24_like_heatshock, bold = T, color = "white", background = "#D7261E")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(height = "400px")
+```
+
+###  RpL14 and RpL30  preserved gene network
+Select genes that overlap across all studies and
+
+```{r}
+RpL14_RpL30_network <- as.data.frame(connectivity_RPL14_Module %>% filter(gene_name %in%connectivity_RPL30_Module$gene_name))
+RpL14_RpL30_network <- RpL14_RpL30_network %>% distinct(gene_id, .keep_all = TRUE) %>% drop_na(gene_name) %>% drop_na(gene_name)
+dim(RpL14_RpL30_network)
+```
+
+Select genes used in this study (all RNAi lines)
+```{r}
+RpL14_RpL30_genes <- which(RpL14_RpL30_network$gene_name %in% rnai)
+RpL14_RpL30_heatshock <- which(RpL14_RpL30_network$gene_name %in% heatshock)
+```
+
+Table of associated network, highlighting the genes used in this study
+```{r , echo=F}
+RpL14_RpL30_network %>% kable(format = "html", caption = "RpL14 and RpL30 preserved gene network.") %>% row_spec(RpL14_RpL30_genes, bold = T, color = "white", background = "#1d2ad7") %>% row_spec(RpL14_RpL30_heatshock, bold = T, color = "white", background = "#D7261E")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(height = "400px")
+```
+###  RpS13 and RpS19b preserved gene network
+Select genes that overlap across all studies and
+
+```{r}
+RpS13_RpS19b_network <- as.data.frame(connectivity_RPS13_Module %>% filter(gene_name %in% connectivity_RPS19b_Module$gene_name))
+RpS13_RpS19b_network <- RpS13_RpS19b_network %>% distinct(gene_id, .keep_all = TRUE) %>% drop_na(gene_name)
+dim(RpS13_RpS19b_network)
+```
+
+Select genes used in this study (all RNAi lines)
+```{r}
+RpS13_RpS19b_genes <- which(RpS13_RpS19b_network$gene_name %in% rnai)
+RpS13_RpS19b_heatshock <- which(RpS13_RpS19b_network$gene_name %in% heatshock)
+```
+
+Table of associated network, highlighting the genes used in this study
+```{r, echo=F}
+RpS13_RpS19b_network %>% kable(format = "html", caption = "RpS13 and RpS19b preserved gene network.") %>% row_spec(RpS13_RpS19b_genes, bold = T, color = "white", background = "#1d2ad7") %>% row_spec(RpS13_RpS19b_heatshock, bold = T, color = "white", background = "#D7261E")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(height = "400px")
+```
+###  RpS13 and RpL19 preserved gene network
+Select genes that overlap across all studies and
+
+```{r}
+RpS13_RpL19_network <- as.data.frame(connectivity_RPS13_Module %>% filter(gene_name %in% connectivity_RPL19_Module$gene_name))
+RpS13_RpL19_network <- RpS13_RpL19_network %>% distinct(gene_id, .keep_all = TRUE) %>% drop_na(gene_name)
+dim(RpS13_RpL19_network)
+```
+
+Select genes used in this study (all RNAi lines)
+```{r}
+RpS13_RpL19_genes <- which(RpS13_RpL19_network$gene_name %in% rnai)
+RpS13_RpL19_heatshock <- which(RpS13_RpL19_network$gene_name %in% heatshock)
+```
+
+Table of associated network, highlighting the genes used in this study
+```{r, echo=F}
+RpS13_RpL19_network %>% kable(format = "html", caption = "RpS13 and RpL19 preserved gene network.") %>% row_spec(RpS13_RpL19_genes, bold = T, color = "white", background = "#1d2ad7") %>% row_spec(RpS13_RpL19_heatshock, bold = T, color = "white", background = "#D7261E")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(height = "400px")
+```
+###  RpS13 and RpL24-like preserved gene network
+Select genes that overlap across all studies and
+
+```{r}
+RpS13_RpL24_like_network <- as.data.frame(connectivity_RPS13_Module %>% filter(gene_name %in% connectivity_RPL24_like_Module$gene_name))
+RpS13_RpL24_like_network <- RpS13_RpL24_like_network %>% distinct(gene_id, .keep_all = TRUE) %>% drop_na(gene_name)
+dim(RpS13_RpL24_like_network)
+```
+
+Select genes used in this study (all RNAi lines)
+```{r}
+RpS13_RpL24_like_genes <- which(RpS13_RpL24_like_network$gene_name %in% rnai)
+RpS13_RpL24_like_heatshock <- which(RpS13_RpL24_like_network$gene_name %in% heatshock)
+```
+
+Table of associated network, highlighting the genes used in this study
+```{r, echo=F}
+RpS13_RpL24_like_network %>% kable(format = "html", caption = "RpS13 and RpL24-like preserved gene network.") %>% row_spec(RpS13_RpL24_like_genes, bold = T, color = "white", background = "#1d2ad7") %>% row_spec(RpS13_RpL24_like_heatshock, bold = T, color = "white", background = "#D7261E")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(height = "400px")
+```
+###  RpS13 and RpL30 preserved gene network
+Select genes that overlap across all studies and
+
+```{r}
+RpS13_RpL30_network <- as.data.frame(connectivity_RPS13_Module %>% filter(gene_name %in% connectivity_RPL30_Module$gene_name))
+RpS13_RpL30_network <- RpS13_RpL30_network %>% distinct(gene_id, .keep_all = TRUE) %>% drop_na(gene_name)
+dim(RpS13_RpL30_network)
+```
+
+Select genes used in this study (all RNAi lines)
+```{r}
+RpS13_RpL30_genes <- which(RpS13_RpL30_network$gene_name %in% rnai)
+RpS13_RpL30_heatshock <- which(RpS13_RpL30_network$gene_name %in% heatshock)
+```
+
+Table of associated network, highlighting the genes used in this study
+```{r, echo=F}
+RpS13_RpL30_network %>% kable(format = "html", caption = "RpS13 and RpL30 preserved gene network.") %>% row_spec(RpS13_RpL30_genes, bold = T, color = "white", background = "#1d2ad7") %>% row_spec(RpS13_RpL30_heatshock, bold = T, color = "white", background = "#D7261E")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(height = "400px")
+```
+
+###  RpS19b and RpL19 preserved gene network
+Select genes that overlap across all studies and
+
+```{r}
+RpS19b_RpL19_network <- as.data.frame(connectivity_RPS19b_Module %>% filter(gene_name %in% connectivity_RPL19_Module$gene_name))
+RpS19b_RpL19_network <- RpS19b_RpL19_network %>% distinct(gene_id, .keep_all = TRUE) %>% drop_na(gene_name)
+dim(RpS19b_RpL19_network)
+```
+
+Select genes used in this study (all RNAi lines)
+```{r}
+RpS19b_RpL19_genes <- which(RpS19b_RpL19_network$gene_name %in% rnai)
+RpS19b_RpL19_heatshock <- which(RpS19b_RpL19_network$gene_name %in% heatshock)
+```
+
+Table of associated network, highlighting the genes used in this study
+```{r, echo=F}
+RpS19b_RpL19_network %>% kable(format = "html", caption = "RpS19b and RpL19 preserved gene network.") %>% row_spec(RpS19b_RpL19_genes, bold = T, color = "white", background = "#1d2ad7") %>% row_spec(RpS19b_RpL19_heatshock, bold = T, color = "white", background = "#D7261E")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(height = "400px")
+```
+###  RpS19b and RpL24-like  preserved gene network
+Select genes that overlap across all studies and
+
+```{r}
+RpS19b_RpL24_like_network <- as.data.frame(connectivity_RPS19b_Module %>% filter(gene_name %in% connectivity_RPL24_like_Module$gene_name))
+RpS19b_RpL24_like_network <- RpS19b_RpL24_like_network %>% distinct(gene_id, .keep_all = TRUE) %>% drop_na(gene_name)
+
+dim(RpS19b_RpL24_like_network)
+```
+
+Select genes used in this study (all RNAi lines)
+```{r}
+RpS19b_RpL24_like_genes <- which(RpS19b_RpL24_like_network$gene_name %in% rnai)
+RpS19b_RpL24_like_heatshock <- which(RpS19b_RpL24_like_network$gene_name %in% heatshock)
+```
+
+Table of associated network, highlighting the genes used in this study
+```{r, echo=F}
+RpS19b_RpL24_like_network %>% kable(format = "html", caption = "RpS19b and RpL24-like preserved gene network.") %>% row_spec(RpS19b_RpL24_like_genes, bold = T, color = "white", background = "#1d2ad7") %>% row_spec(RpS19b_RpL24_like_heatshock, bold = T, color = "white", background = "#D7261E")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(height = "400px")
+```
+###  RpS19b and RpL30 preserved gene network
+Select genes that overlap across all studies and
+
+```{r}
+RpS19b_RpL30_network <- as.data.frame(connectivity_RPS19b_Module %>% filter(gene_name %in% connectivity_RPL30_Module$gene_name))
+RpS19b_RpL30_network <- RpS19b_RpL30_network
+dim(RpS19b_RpL30_network)
+```
+
+Select genes used in this study (all RNAi lines)
+```{r}
+RpS19b_RpL30_genes <- which(RpS19b_RpL30_network$gene_name %in% rnai)
+RpS19b_RpL30_heatshock <- which(RpS19b_RpL30_network$gene_name %in% heatshock)
+```
+
+Table of associated network, highlighting the genes used in this study
+```{r, echo=F}
+RpS19b_RpL30_network %>% kable(format = "html", caption = "RpS19b and RpL30 preserved gene network.") %>% row_spec(RpS19b_RpL30_genes, bold = T, color = "white", background = "#1d2ad7") %>% row_spec(RpS19b_RpL30_heatshock, bold = T, color = "white", background = "#D7261E")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(height = "400px")
+```
+###  RpL19 and RpL24-like preserved gene network
+Select genes that overlap across all studies and
+
+```{r}
+RpL19_RpL24_like_network <- as.data.frame(connectivity_RPL19_Module %>% filter(gene_name %in% connectivity_RPL24_like_Module$gene_name))
+RpL19_RpL24_like_network <- RpL19_RpL24_like_network
+dim(RpL19_RpL24_like_network)
+```
+
+Select genes used in this study (all RNAi lines)
+```{r}
+RpL19_RpL24_like_genes <- which(RpL19_RpL24_like_network$gene_name %in% rnai)
+RpL19_RpL24_like_heatshock <- which(RpL19_RpL24_like_network$gene_name %in% heatshock)
+```
+
+Table of associated network, highlighting the genes used in this study
+```{r, echo=F}
+RpL19_RpL24_like_network %>% kable(format = "html", caption = "RpL19 and RpL24-like preserved gene network.") %>% row_spec(RpL19_RpL24_like_genes, bold = T, color = "white", background = "#1d2ad7") %>% row_spec(RpL19_RpL24_like_heatshock, bold = T, color = "white", background = "#D7261E")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(height = "400px")
+```
+
+###  RpL19 and RpL30 preserved gene network
+Select genes that overlap across all studies and
+
+```{r}
+RpL19_RpL30_network <- as.data.frame(connectivity_RPL19_Module %>% filter(gene_name %in% connectivity_RPL30_Module$gene_name))
+RpL19_RpL30_network <- RpL19_RpL30_network
+dim(RpL19_RpL30_network)
+```
+
+Select genes used in this study (all RNAi lines)
+```{r}
+RpL19_RpL30_genes <- which(RpL19_RpL30_network$gene_name %in% rnai)
+RpL19_RpL30_heatshock <- which(RpL19_RpL30_network$gene_name %in% heatshock)
+```
+
+Table of associated network, highlighting the genes used in this study
+```{r, echo=F}
+RpL19_RpL30_network %>% kable(format = "html", caption = "RpL19 and RpL30 preserved gene network.") %>% row_spec(RpL19_RpL30_genes, bold = T, color = "white", background = "#1d2ad7") %>% row_spec(RpL19_RpL30_heatshock, bold = T, color = "white", background = "#D7261E")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(height = "400px")
+```
+
+###  RpL24-like and RpL30 preserved gene network
+Select genes that overlap across all studies and
+
+```{r}
+RpL24_like_RpL30_network <- as.data.frame(connectivity_RPL24_like_Module %>% filter(gene_name %in% connectivity_RPL30_Module$gene_name))
+RpL24_like_RpL30_network <- RpL24_like_RpL30_network
+dim(RpL24_like_RpL30_network)
+```
+
+Select genes used in this study (all RNAi lines)
+```{r}
+RpL24_like_RpL30_genes <- which(RpL24_like_RpL30_network$gene_name %in% rnai)
+RpL24_like_RpL30_heatshock <- which(RpL24_like_RpL30_network$gene_name %in% heatshock)
+```
+
+Table of associated network, highlighting the genes used in this study
+```{r, echo=F}
+RpL24_like_RpL30_network %>% kable(format = "html", caption = "RpL24-like and RpL30 preserved gene network.") %>% row_spec(RpL24_like_RpL30_genes, bold = T, color = "white", background = "#1d2ad7") %>% row_spec(RpL24_like_RpL30_heatshock, bold = T, color = "white", background = "#D7261E")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(height = "400px")
+```
+
+##  7- GO term enrichment {.tabset .tabset-fade}
+Load funciton that will be used in this stage
+
+```{r}
+source("GO_terms_compile_BP.R")
+mart <- useMart(biomart = "ENSEMBL_MART_ENSEMBL", dataset = "dmelanogaster_gene_ensembl", host = 'may2017.archive.ensembl.org')
+t2g <- getBM(attributes = c("ensembl_gene_id", "external_gene_name"), mart = mart)
+t2g <- dplyr::rename(t2g, gene_id = ensembl_gene_id, gene_name = external_gene_name)
+```
+###  RpL3: GO term
+Selecting genes hub genes related with the RpL3 module.
+```{r}
+maxTopGenes <- 65
+RPL3_hub_genes<-rownames(RPL3_Dif_exp_network)[order(RPL3_Dif_exp_network$GS, decreasing = F)[1:maxTopGenes]]                     
+RPL3_hub_genes <- data.frame(gene_id = RPL3_Dif_exp_network[RPL3_hub_genes,"gene_id"],ID =RPL3_Dif_exp_network[RPL3_hub_genes,"gene_name"], DGE=RPL3_Dif_exp_network[RPL3_hub_genes,"RPL3_DGE"],Signif = RPL3_Dif_exp_network[RPL3_hub_genes,"GS"])  
+```
+Calling function to perform the GO enrichment analysis
+```{r}
+RPL3_ModuleG <- summary(enrichGO(gene = RPL3_hub_genes$gene, OrgDb = org.Dm.eg.db, keyType = 'ENSEMBL', ont = "BP", pvalueCutoff = 1, qvalueCutoff = 1))
+RPL3_ModuleG = as_tibble(RPL3_ModuleG)
+dim(RPL3_ModuleG)
+```
+Selecting data to plot.
+```{r}
+RPL3_ModuleG<- data.frame(ID =RPL3_ModuleG$ID, Term=RPL3_ModuleG$Description,Genes=RPL3_ModuleG$geneID, pvalue=RPL3_ModuleG$pvalue)
+RPL3_gene_list<-data.frame(ID = RPL3_hub_genes$gene_id, DGE=RPL3_hub_genes$DGE,Signif= RPL3_hub_genes$Signif, gene_id =RPL3_hub_genes$ID)
+```
+Calling the modified "circle_dat" function from the package "GOplot". The modified version can be visualised in the file "GO_terms_compile_BP.R".
+```{r}
+RPL3_Circular <- as.data.frame(DGE_dat(RPL3_ModuleG, RPL3_gene_list)) %>% dplyr::distinct(gene_id, .keep_all = TRUE) %>%  dplyr::select(term,gene_id,DGE, Signif) %>% drop_na(DGE) 
+```
+Plotting the chord diagram. The arc flow represents the connection between the RpL3 hub genes and the GO-BP analysis. The size of the arc refers to the respective gene differential expression. Genes in blue down-regulated and genes in red are upregulates in the RpL3 module.
+```{r eval=FALSE}
+circos.clear()
+# Selecting colour palette
+mycolor <- viridis(length((RPL3_Circular$term)),alpha = 1, begin = 0, end = 1, option = "D")
+mycolor <- sample(mycolor, length(RPL3_Circular$term))
+col_fun = colorRamp2(c(-0.99, 1, 0.99),c("blue", "white", "red"))
+col = HeatmapAnnotation(foo = 1:10, col = list(foo = col_fun))
+col = col_fun(RPL3_Circular$DGE) ##Setting color for the differential expression
+RPL3_grid.col = NULL # just create the variable
+RPL3_grid.col[RPL3_Circular$gene_id] = col
+RPL3_grid.col[RPL3_Circular$term] = mycolor
+```
+Circular plot
+```{r height=1600, res=400, units="px", width=1600}
+circos.par(start.degree = 100, points.overflow.warning = T)
+par(cex = 2, mar = c(0, 0, 0, 0))
+
+chordDiagram(RPL3_Circular[,1:3],grid.col = RPL3_grid.col, annotationTrack = "grid", annotationTrackHeight = c(0.08, 0.08), directional = 1, diffHeight = -0.04, transparency = 0.5, preAllocateTracks = list(track.height = max(strwidth(unlist(dimnames(RPL3_Circular[,1:3]))))))
+# we go back to the first track and customize sector labels
+circos.track(track.index = 1, panel.fun = function(x, y) {
+   circos.text(CELL_META$xcenter, CELL_META$ylim[1], CELL_META$sector.index, facing = "clockwise", cex = 0.5, niceFacing = TRUE, adj = c(0,0.4)) }, bg.border = NA, track.height = 0.1)
+
+circos.clear() 
+```
+
+###  RpL14: GO term
+
+```{r}
+maxTopGenes <- 65
+RPL14_hub_genes<-rownames(RPL14_Dif_exp_network)[order(RPL14_Dif_exp_network$GS, decreasing = F)[1:maxTopGenes]]                     
+RPL14_hub_genes <- data.frame(gene_id = RPL14_Dif_exp_network[RPL14_hub_genes,"gene_id"],ID =RPL14_Dif_exp_network[RPL14_hub_genes,"gene_name"], DGE=RPL14_Dif_exp_network[RPL14_hub_genes,"RPL14_DGE"],Signif = RPL14_Dif_exp_network[RPL14_hub_genes,"GS"])  
+```
+Calling function to perform the GO enrichment analysis
+```{r}
+RPL14_ModuleG <- summary(enrichGO(gene = RPL14_hub_genes$gene, OrgDb = org.Dm.eg.db, keyType = 'ENSEMBL', ont = "BP", pvalueCutoff = 1, qvalueCutoff = 1))
+RPL14_ModuleG = as_tibble(RPL14_ModuleG)
+dim(RPL14_ModuleG)
+```
+Selecting data to plot.
+```{r}
+RPL14_ModuleG<- data.frame(ID =RPL14_ModuleG$ID, Term=RPL14_ModuleG$Description,Genes=RPL14_ModuleG$geneID, pvalue=RPL14_ModuleG$pvalue)
+RPL14_gene_list<-data.frame(ID = RPL14_hub_genes$gene_id, DGE=RPL14_hub_genes$DGE,Signif= RPL14_hub_genes$Signif, gene_id =RPL14_hub_genes$ID)
+```
+Calling the modified "circle_dat" function from the package "GOplot". The modified version can be visualised in the file "GO_terms_compile_BP.R".
+```{r}
+RPL14_Circular <- as.data.frame(DGE_dat(RPL14_ModuleG, RPL14_gene_list)) %>% dplyr::distinct(gene_id, .keep_all = TRUE) %>%  dplyr::select(term,gene_id,DGE, Signif) %>% drop_na(DGE) 
+```
+Plotting the chord diagram. The arc flow represents the connection between the RpL14 hub genes and the GO-BP analysis. The size of the arc refers to the respective gene differential expression. Genes in blue down-regulated and genes in red are upregulates in the RpL14 module.
+```{r eval=FALSE}
+# Selecting colour palette
+mycolor <- viridis(length((RPL14_Circular$term)),alpha = 1, begin = 0, end = 1, option = "D")
+mycolor <- sample(mycolor, length(RPL14_Circular$term))
+col_fun = colorRamp2(c(-0.99, 1, 0.99),c("blue", "white", "red"))
+col = HeatmapAnnotation(foo = 1:10, col = list(foo = col_fun))
+col = col_fun(RPL14_Circular$DGE) ##Setting color for the differential expression
+RPL14_grid.col = NULL # just create the variable
+RPL14_grid.col[RPL14_Circular$gene_id] = col
+RPL14_grid.col[RPL14_Circular$term] = mycolor
+```
+Circular plot
+```{r , units="px", width=1600, height=1600, res=400}
+circos.par(start.degree = 100, points.overflow.warning = T)
+par(cex = 2, mar = c(0, 0, 0, 0))
+chordDiagram(RPL14_Circular[,1:3],grid.col = RPL14_grid.col, annotationTrack = "grid", annotationTrackHeight = c(0.08, 0.08), directional = 1, diffHeight = -0.04, transparency = 0.5, preAllocateTracks = list(track.height = max(strwidth(unlist(dimnames(RPL14_Circular[,1:3]))))))
+   # we go back to the first track and customize sector labels
+   circos.track(track.index = 1, panel.fun = function(x, y) {
+      circos.text(CELL_META$xcenter, CELL_META$ylim[1], CELL_META$sector.index, facing = "clockwise", cex = 0.5, niceFacing = TRUE, adj = c(0,0.4)) }, bg.border = NA, track.height = 0.1)
+
+circos.clear() 
+```
+
+###  RpS13: GO term
+```{r}
+maxTopGenes <- 65
+RPS13_hub_genes<-rownames(RPS13_Dif_exp_network)[order(RPS13_Dif_exp_network$GS, decreasing = F)[1:maxTopGenes]]                     
+RPS13_hub_genes <- data.frame(gene_id = RPS13_Dif_exp_network[RPS13_hub_genes,"gene_id"],ID =RPS13_Dif_exp_network[RPS13_hub_genes,"gene_name"], DGE=RPS13_Dif_exp_network[RPS13_hub_genes,"RPS13_DGE"],Signif = RPS13_Dif_exp_network[RPS13_hub_genes,"GS"])  
+```
+Calling function to perform the GO enrichment analysis
+```{r}
+RPS13_ModuleG <- summary(enrichGO(gene = RPS13_hub_genes$gene, OrgDb = org.Dm.eg.db, keyType = 'ENSEMBL', ont = "BP", pvalueCutoff = 1, qvalueCutoff = 1))
+RPS13_ModuleG = as_tibble(RPS13_ModuleG)
+dim(RPS13_ModuleG)
+```
+Selecting data to plot.
+```{r}
+RPS13_ModuleG<- data.frame(ID =RPS13_ModuleG$ID, Term=RPS13_ModuleG$Description,Genes=RPS13_ModuleG$geneID, pvalue=RPS13_ModuleG$pvalue)
+RPS13_gene_list<-data.frame(ID = RPS13_hub_genes$gene_id, DGE=RPS13_hub_genes$DGE,Signif= RPS13_hub_genes$Signif, gene_id =RPS13_hub_genes$ID)
+```
+Calling the modified "circle_dat" function from the package "GOplot". The modified version can be visualised in the file "GO_terms_compile_BP.R".
+```{r}
+RPS13_Circular <- as.data.frame(DGE_dat(RPS13_ModuleG, RPS13_gene_list)) %>% dplyr::distinct(gene_id, .keep_all = TRUE) %>%  dplyr::select(term,gene_id,DGE, Signif) %>% drop_na(DGE) 
+```
+Plotting the chord diagram. The arc flow represents the connection between the RpS13 hub genes and the GO-BP analysis. The size of the arc refers to the respective gene differential expression. Genes in blue down-regulated and genes in red are upregulates in the RpS13 module.
+```{r eval=FALSE}
+# Selecting colour palette
+mycolor <- viridis(length((RPS13_Circular$term)),alpha = 1, begin = 0, end = 1, option = "D")
+mycolor <- sample(mycolor, length(RPS13_Circular$term))
+col_fun = colorRamp2(c(-0.99, 1, 0.99),c("blue", "white", "red"))
+col = HeatmapAnnotation(foo = 1:10, col = list(foo = col_fun))
+col = col_fun(RPS13_Circular$DGE) ##Setting color for the differential expression
+RPS13_grid.col = NULL # just create the variable
+RPS13_grid.col[RPS13_Circular$gene_id] = col
+RPS13_grid.col[RPS13_Circular$term] = mycolor
+```
+Circular plot
+```{r , units="px", width=1600, height=1600, res=400}
+circos.par(start.degree = 100, points.overflow.warning = T)
+par(cex = 2, mar = c(0, 0, 0, 0))
+chordDiagram(RPS13_Circular[,1:3],grid.col = RPS13_grid.col, annotationTrack = "grid", annotationTrackHeight = c(0.08, 0.08), directional = 1, diffHeight = -0.04, transparency = 0.5, preAllocateTracks = list(track.height = max(strwidth(unlist(dimnames(RPS13_Circular[,1:3]))))))
+   # we go back to the first track and customize sector labels
+   circos.track(track.index = 1, panel.fun = function(x, y) {
+      circos.text(CELL_META$xcenter, CELL_META$ylim[1], CELL_META$sector.index, facing = "clockwise", cex = 0.50, niceFacing = TRUE, adj = c(0,0.4)) }, bg.border = NA, track.height = 0.1)
+
+circos.clear()  
+```
+
+###  RpS19b: GO term
+```{r}
+maxTopGenes <- 65
+RPS19b_hub_genes<-rownames(RPS19b_Dif_exp_network)[order(RPS19b_Dif_exp_network$GS, decreasing = F)[1:maxTopGenes]]                     
+RPS19b_hub_genes <- data.frame(gene_id = RPS19b_Dif_exp_network[RPS19b_hub_genes,"gene_id"],ID =RPS19b_Dif_exp_network[RPS19b_hub_genes,"gene_name"], DGE=RPS19b_Dif_exp_network[RPS19b_hub_genes,"RPS19b_DGE"],Signif = RPS19b_Dif_exp_network[RPS19b_hub_genes,"GS"])  
+```
+Calling function to perform the GO enrichment analysis
+```{r}
+RPS19b_ModuleG <- summary(enrichGO(gene = RPS19b_hub_genes$gene, OrgDb = org.Dm.eg.db, keyType = 'ENSEMBL', ont = "BP", pvalueCutoff = 1, qvalueCutoff = 1))
+RPS19b_ModuleG = as_tibble(RPS19b_ModuleG)
+dim(RPS19b_ModuleG)
+```
+Selecting data to plot.
+```{r}
+RPS19b_ModuleG<- data.frame(ID =RPS19b_ModuleG$ID, Term=RPS19b_ModuleG$Description,Genes=RPS19b_ModuleG$geneID, pvalue=RPS19b_ModuleG$pvalue)
+RPS19b_gene_list<-data.frame(ID = RPS19b_hub_genes$gene_id, DGE=RPS19b_hub_genes$DGE,Signif= RPS19b_hub_genes$Signif, gene_id =RPS19b_hub_genes$ID)
+```
+Calling the modified "circle_dat" function from the package "GOplot". The modified version can be visualised in the file "GO_terms_compile_BP.R".
+```{r}
+RPS19b_Circular <- as.data.frame(DGE_dat(RPS19b_ModuleG, RPS19b_gene_list)) %>% dplyr::distinct(gene_id, .keep_all = TRUE) %>%  dplyr::select(term,gene_id,DGE, Signif) %>% drop_na(DGE) 
+```
+Plotting the chord diagram. The arc flow represents the connection between the RpS19b hub genes and the GO-BP analysis. The size of the arc refers to the respective gene differential expression. Genes in blue down-regulated and genes in red are upregulates in the RpS19b module.
+```{r, eval=FALSE}
+# Selecting colour palette
+RPS19b_mycolor <- viridis(length((RPS19b_Circular$term)),alpha = 1, begin = 0, end = 1, option = "D")
+RPS19b_mycolor <- sample(RPS19b_mycolor, length(RPS19b_Circular$term))
+RPS19b_col_fun = colorRamp2(c(-0.99, 1, 0.99),c("blue", "white", "red"))
+RPS19b_col = HeatmapAnnotation(foo = 1:10, col = list(foo = RPS19b_col_fun))
+RPS19b_col = RPS19b_col_fun(RPS19b_Circular$DGE) ##Setting color for the differential expression
+RPS19b_grid.col = NULL # just create the variable
+RPS19b_grid.col[RPS19b_Circular$gene_id] = RPS19b_col
+RPS19b_grid.col[RPS19b_Circular$term] = RPS19b_mycolor
+```
+Circular plot
+```{r , units="px", width=1600, height=1600, res=400}
+circos.par(start.degree = 100, points.overflow.warning = T)
+par(cex = 2, mar = c(0, 0, 0, 0))
+chordDiagram(RPS19b_Circular[,1:3],grid.col = RPS19b_grid.col, annotationTrack = "grid", annotationTrackHeight = c(0.08, 0.08), directional = 1, diffHeight = -0.04, transparency = 0.5, preAllocateTracks = list(track.height = max(strwidth(unlist(dimnames(RPS19b_Circular[,1:3]))))))
+   # we go back to the first track and customize sector labels
+   circos.track(track.index = 1, panel.fun = function(x, y) {
+      circos.text(CELL_META$xcenter, CELL_META$ylim[1], CELL_META$sector.index, facing = "clockwise", cex = 0.50, niceFacing = TRUE, adj = c(0,0.4)) }, bg.border = NA, track.height = 0.1)
+
+circos.clear()  
+```
+
+###  RpL19: GO term
+```{r}
+maxTopGenes <- 65
+RPL19_hub_genes<-rownames(RPL19_Dif_exp_network)[order(RPL19_Dif_exp_network$GS, decreasing = F)[1:maxTopGenes]]                     
+RPL19_hub_genes <- data.frame(gene_id = RPL19_Dif_exp_network[RPL19_hub_genes,"gene_id"],ID =RPL19_Dif_exp_network[RPL19_hub_genes,"gene_name"], DGE=RPL19_Dif_exp_network[RPL19_hub_genes,"RPL19_DGE"],Signif = RPL19_Dif_exp_network[RPL19_hub_genes,"GS"])  
+```
+Calling function to perform the GO enrichment analysis
+```{r}
+RPL19_ModuleG <- summary(enrichGO(gene = RPL19_hub_genes$gene, OrgDb = org.Dm.eg.db, keyType = 'ENSEMBL', ont = "BP", pvalueCutoff = 1, qvalueCutoff = 1))
+RPL19_ModuleG = as_tibble(RPL19_ModuleG)
+dim(RPL19_ModuleG)
+```
+Selecting data to plot.
+```{r}
+RPL19_ModuleG<- data.frame(ID =RPL19_ModuleG$ID, Term=RPL19_ModuleG$Description,Genes=RPL19_ModuleG$geneID, pvalue=RPL19_ModuleG$pvalue)
+RPL19_gene_list<-data.frame(ID = RPL19_hub_genes$gene_id, DGE=RPL19_hub_genes$DGE,Signif= RPL19_hub_genes$Signif, gene_id =RPL19_hub_genes$ID)
+```
+Calling the modified "circle_dat" function from the package "GOplot". The modified version can be visualised in the file "GO_terms_compile_BP.R".
+```{r}
+RPL19_Circular <- as.data.frame(DGE_dat(RPL19_ModuleG, RPL19_gene_list)) %>% dplyr::distinct(gene_id, .keep_all = TRUE) %>%  dplyr::select(term,gene_id,DGE, Signif) %>% drop_na(DGE) 
+```
+Plotting the chord diagram. The arc flow represents the connection between the RpL19 hub genes and the GO-BP analysis. The size of the arc refers to the respective gene differential expression. Genes in blue down-regulated and genes in red are upregulates in the RpL19 module.
+```{r, eval=FALSE}
+# Selecting colour palette
+
+RPL19_mycolor <- viridis(length((RPL19_Circular$term)),alpha = 1, begin = 0, end = 1, option = "D")
+RPL19_mycolor <- sample(RPL19_mycolor, length(RPL19_Circular$term))
+RPL19_col_fun = colorRamp2(c(-0.99, 1, 0.99),c("blue", "white", "red"))
+RPL19_col = HeatmapAnnotation(foo = 1:10, col = list(foo = RPL19_col_fun))
+RPL19_col = RPL19_col_fun(RPL19_Circular$DGE) ##Setting color for the differential expression
+RPL19_grid.col = NULL # just create the variable
+RPL19_grid.col[RPL19_Circular$gene_id] = RPL19_col
+RPL19_grid.col[RPL19_Circular$term] = RPL19_mycolor
+```
+Circular plot
+```{r , units="px", width=1600, height=1600, res=400}
+circos.par(start.degree = 100, points.overflow.warning = T)
+par(cex = 2, mar = c(0, 0, 0, 0))
+chordDiagram(RPL19_Circular[,1:3],grid.col = RPL19_grid.col, annotationTrack = "grid", annotationTrackHeight = c(0.08, 0.08), directional = 1, diffHeight = -0.04, transparency = 0.5, preAllocateTracks = list(track.height = max(strwidth(unlist(dimnames(RPL19_Circular[,1:3]))))))
+   # we go back to the first track and customize sector labels
+   circos.track(track.index = 1, panel.fun = function(x, y) {
+      circos.text(CELL_META$xcenter, CELL_META$ylim[1], CELL_META$sector.index, facing = "clockwise", cex = 0.5, niceFacing = TRUE, adj = c(0,0.4)) }, bg.border = NA, track.height = 0.1)
+
+circos.clear()  
+```
+
+###  RpL24-like: GO term
+```{r}
+maxTopGenes <- 65
+RPL24_like_hub_genes<-rownames(RPL24_like_Dif_exp_network)[order(RPL24_like_Dif_exp_network$GS, decreasing = F)[1:maxTopGenes]]                     
+RPL24_like_hub_genes <- data.frame(gene_id = RPL24_like_Dif_exp_network[RPL24_like_hub_genes,"gene_id"],ID =RPL24_like_Dif_exp_network[RPL24_like_hub_genes,"gene_name"], DGE=RPL24_like_Dif_exp_network[RPL24_like_hub_genes,"RPL24_like_DGE"],Signif = RPL24_like_Dif_exp_network[RPL24_like_hub_genes,"GS"])  
+```
+Calling function to perform the GO enrichment analysis
+```{r}
+RPL24_like_ModuleG <- summary(enrichGO(gene = RPL24_like_hub_genes$gene, OrgDb = org.Dm.eg.db, keyType = 'ENSEMBL', ont = "BP", pvalueCutoff = 1, qvalueCutoff = 1))
+RPL24_like_ModuleG = as_tibble(RPL24_like_ModuleG)
+dim(RPL24_like_ModuleG)
+```
+Selecting data to plot.
+```{r}
+RPL24_like_ModuleG<- data.frame(ID =RPL24_like_ModuleG$ID, Term=RPL24_like_ModuleG$Description,Genes=RPL24_like_ModuleG$geneID, pvalue=RPL24_like_ModuleG$pvalue)
+RPL24_like_gene_list<-data.frame(ID = RPL24_like_hub_genes$gene_id, DGE=RPL24_like_hub_genes$DGE,Signif= RPL24_like_hub_genes$Signif, gene_id =RPL24_like_hub_genes$ID)
+```
+Calling the modified "circle_dat" function from the package "GOplot". The modified version can be visualised in the file "GO_terms_compile_BP.R".
+```{r}
+RPL24_like_Circular <- as.data.frame(DGE_dat(RPL24_like_ModuleG, RPL24_like_gene_list)) %>% dplyr::distinct(gene_id, .keep_all = TRUE) %>%  dplyr::select(term,gene_id,DGE, Signif) %>% drop_na(DGE) 
+```
+Plotting the chord diagram. The arc flow represents the connection between the RpL24-like hub genes and the GO-BP analysis. The size of the arc refers to the respective gene differential expression. Genes in blue down-regulated and genes in red are upregulates in the RpL24-like module.
+```{r, eval=FALSE}
+# Selecting colour palette
+RPL24_like_mycolor <- viridis(length((RPL24_like_Circular$term)),alpha = 1, begin = 0, end = 1, option = "D")
+RPL24_like_mycolor <- sample(RPL24_like_mycolor, length(RPL24_like_Circular$term))
+RPL24_like_col_fun = colorRamp2(c(-0.99, 1, 0.99),c("blue", "white", "red"))
+RPL24_like_col = HeatmapAnnotation(foo = 1:10, col = list(foo = RPL24_like_col_fun))
+RPL24_like_col = RPL24_like_col_fun(RPL24_like_Circular$DGE) ##Setting color for the differential expression
+RPL24_like_grid.col = NULL # just create the variable
+RPL24_like_grid.col[RPL24_like_Circular$gene_id] = RPL24_like_col
+RPL24_like_grid.col[RPL24_like_Circular$term] = RPL24_like_mycolor
+```
+Circular plot
+```{r , units="px", width=1600, height=1600, res=400}
+circos.par(start.degree = 100, points.overflow.warning = T)
+par(cex = 2, mar = c(0, 0, 0, 0))
+chordDiagram(RPL24_like_Circular[,1:3],grid.col = RPL24_like_grid.col, annotationTrack = "grid", annotationTrackHeight = c(0.08, 0.08), directional = 1, diffHeight = -0.04, transparency = 0.5, preAllocateTracks = list(track.height = max(strwidth(unlist(dimnames(RPL24_like_Circular[,1:3]))))))
+   # we go back to the first track and customize sector labels
+   circos.track(track.index = 1, panel.fun = function(x, y) {
+      circos.text(CELL_META$xcenter, CELL_META$ylim[1], CELL_META$sector.index, facing = "clockwise", cex = 0.50, niceFacing = TRUE, adj = c(0,0.4)) }, bg.border = NA, track.height = 0.1)
+
+circos.clear()  
+
+```
+
+###  RpL30: GO term
+```{r}
+maxTopGenes <- 65
+RPL30_hub_genes<-rownames(RPL30_Dif_exp_network)[order(RPL30_Dif_exp_network$GS, decreasing = F)[1:maxTopGenes]]                     
+RPL30_hub_genes <- data.frame(gene_id = RPL30_Dif_exp_network[RPL30_hub_genes,"gene_id"],ID =RPL30_Dif_exp_network[RPL30_hub_genes,"gene_name"], DGE=RPL30_Dif_exp_network[RPL30_hub_genes,"RPL30_DGE"],Signif = RPL30_Dif_exp_network[RPL30_hub_genes,"GS"])  
+```
+Calling function to perform the GO enrichment analysis
+```{r}
+RPL30_ModuleG <- summary(enrichGO(gene = RPL30_hub_genes$gene, OrgDb = org.Dm.eg.db, keyType = 'ENSEMBL', ont = "BP", pvalueCutoff = 1, qvalueCutoff = 1))
+RPL30_ModuleG = as_tibble(RPL30_ModuleG)
+dim(RPL30_ModuleG)
+```
+Selecting data to plot.
+```{r}
+RPL30_ModuleG<- data.frame(ID =RPL30_ModuleG$ID, Term=RPL30_ModuleG$Description,Genes=RPL30_ModuleG$geneID, pvalue=RPL30_ModuleG$pvalue)
+RPL30_gene_list<-data.frame(ID = RPL30_hub_genes$gene_id, DGE=RPL30_hub_genes$DGE,Signif= RPL30_hub_genes$Signif, gene_id =RPL30_hub_genes$ID)
+```
+Calling the modified "circle_dat" function from the package "GOplot". The modified version can be visualised in the file "GO_terms_compile_BP.R".
+```{r}
+RPL30_Circular <- as.data.frame(DGE_dat(RPL30_ModuleG, RPL30_gene_list)) %>% dplyr::distinct(gene_id, .keep_all = TRUE) %>%  dplyr::select(term,gene_id,DGE, Signif) %>% drop_na(DGE) 
+```
+Plotting the chord diagram. The arc flow represents the connection between the RpL30 hub genes and the GO-BP analysis. The size of the arc refers to the respective gene differential expression. Genes in blue down-regulated and genes in red are upregulates in the RpL30 module.
+```{r eval=FALSE}
+# Selecting colour palette
+RPL30_mycolor <- viridis(length((RPL30_Circular$term)),alpha = 1, begin = 0, end = 1, option = "D")
+RPL30_mycolor <- sample(RPL30_mycolor, length(RPL30_Circular$term))
+RPL30_col_fun = colorRamp2(c(-0.99, 1, 0.99),c("blue", "white", "red"))
+RPL30_col = HeatmapAnnotation(foo = 1:10, col = list(foo = RPL30_col_fun))
+RPL30_col = RPL30_col_fun(RPL30_Circular$DGE) ##Setting color for the differential expression
+RPL30_grid.col = NULL # just create the variable
+RPL30_grid.col[RPL30_Circular$gene_id] = RPL30_col
+RPL30_grid.col[RPL30_Circular$term] = RPL30_mycolor
+```
+Circular plot
+```{r , units="px", width=1600, height=1600, res=400}
+circos.par(start.degree = 100, points.overflow.warning = T)
+par(cex = 2, mar = c(0, 0, 0, 0))
+chordDiagram(RPL30_Circular[,1:3],grid.col = RPL30_grid.col, annotationTrack = "grid", annotationTrackHeight = c(0.08, 0.08), directional = 1, diffHeight = -0.04, transparency = 0.5, preAllocateTracks = list(track.height = max(strwidth(unlist(dimnames(RPL30_Circular[,1:3]))))))
+   # we go back to the first track and customize sector labels
+   circos.track(track.index = 1, panel.fun = function(x, y) {
+      circos.text(CELL_META$xcenter, CELL_META$ylim[1], CELL_META$sector.index, facing = "clockwise", cex = 0.5, niceFacing = TRUE, adj = c(0,0.4)) }, bg.border = NA, track.height = 0.1)
+
+circos.clear()  
+```
+
+
+## Session info
+```{r include=FALSE}
+save.image(file="~/Dropbox/Pesquisa/Post-doc/Minute_project/WGCNA/RDS/Minute_analysis.RData")
+```
+
+```{r}
+devtools::session_info()
+```
